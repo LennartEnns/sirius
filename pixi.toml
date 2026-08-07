@@ -14,7 +14,7 @@ scripts = ["scripts/pixi_activate.sh"]
 
 [activation.env]
 SCCACHE_BASEDIRS = "$PIXI_PROJECT_ROOT:$CONDA_PREFIX"
-TMPDIR = "/data/i750047/tmp"
+TMPDIR = "/data/home/i750047/tmp"
 
 [dependencies]
 bc = "*"
