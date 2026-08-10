@@ -279,6 +279,16 @@ void SiriusContext::QueryEnd(ClientContext& context, optional_ptr<ErrorData> err
   QueryEnd(context);
 }
 
+void SiriusContext::OnBeforeExtensionLoad(ClientContext& /*context*/)
+{
+  enter_internal_query();
+}
+
+void SiriusContext::OnAfterExtensionLoad(ClientContext& /*context*/)
+{
+  exit_internal_query();
+}
+
 void SiriusContext::initialize(const sirius::sirius_config& config)
 {
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }
