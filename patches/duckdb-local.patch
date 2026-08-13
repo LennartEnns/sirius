@@ -1,0 +1,59 @@
+diff --git a/CMakePresets.json b/CMakePresets.json
+new file mode 120000
+index 0000000000..19b10dbb1a
+--- /dev/null
++++ b/CMakePresets.json
+@@ -0,0 +1 @@
++/data/home/i750047/gpu-query-benchmark/engines/sirius/cmake/CMakePresets.json
+\ No newline at end of file
+diff --git a/src/execution/operator/helper/physical_load.cpp b/src/execution/operator/helper/physical_load.cpp
+index d6bcda546e..f983acf1ca 100644
+--- a/src/execution/operator/helper/physical_load.cpp
++++ b/src/execution/operator/helper/physical_load.cpp
+@@ -1,5 +1,6 @@
+ #include "duckdb/execution/operator/helper/physical_load.hpp"
+ #include "duckdb/main/extension_helper.hpp"
++#include "duckdb/main/client_context_state.hpp"
+ 
+ namespace duckdb {
+ 
+@@ -39,7 +40,20 @@ SourceResultType PhysicalLoad::GetDataInternal(ExecutionContext &context, DataCh
+ 		}
+ 
+ 	} else {
+-		ExtensionHelper::LoadExternalExtension(context.client, info->filename);
++		for (auto &state : context.client.registered_state->States()) {
++			state->OnBeforeExtensionLoad(context.client);
++		}
++		try {
++			ExtensionHelper::LoadExternalExtension(context.client, info->filename);
++		} catch (...) {
++			for (auto &state : context.client.registered_state->States()) {
++				state->OnAfterExtensionLoad(context.client);
++			}
++			throw;
++		}
++		for (auto &state : context.client.registered_state->States()) {
++			state->OnAfterExtensionLoad(context.client);
++		}
+ 	}
+ 
+ 	return SourceResultType::FINISHED;
+diff --git a/src/include/duckdb/main/client_context_state.hpp b/src/include/duckdb/main/client_context_state.hpp
+index fcedae943d..c822e6e48f 100644
+--- a/src/include/duckdb/main/client_context_state.hpp
++++ b/src/include/duckdb/main/client_context_state.hpp
+@@ -94,6 +94,13 @@ public:
+ 	}
+ 	virtual void OnTaskStop(ClientContext &context) {
+ 	}
++	// Called immediately before and after an extension .duckdb_extension is loaded.
++	// Implementations that hold per-query locks must suppress re-entrant QueryBegin
++	// callbacks while an extension's init function may open internal connections.
++	virtual void OnBeforeExtensionLoad(ClientContext &context) {
++	}
++	virtual void OnAfterExtensionLoad(ClientContext &context) {
++	}
+ 
+ public:
+ 	template <class TARGET>
