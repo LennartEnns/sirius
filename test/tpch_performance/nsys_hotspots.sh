@@ -19,6 +19,108 @@
 
 set -euo pipefail
 
+# ---------------------------------------------------------------------------
+# sqlite3 compatibility — use the system binary when available, else fall back
+# to a Python emulator that covers the dot-command subset used by this script
+# (.mode markdown, .mode insert, .headers on/off, .print).
+# ---------------------------------------------------------------------------
+if ! command -v sqlite3 &>/dev/null; then
+    _PY=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)
+    if [ -z "$_PY" ]; then
+        echo "ERROR: sqlite3 not found and no python3/python available as fallback" >&2
+        exit 1
+    fi
+    _SQLITE3_PY=$(mktemp /tmp/sqlite3_py_XXXXXX.py)
+    trap 'rm -f "$_SQLITE3_PY"' EXIT
+    cat > "$_SQLITE3_PY" << 'PYEOF'
+#!/usr/bin/env python3
+"""Minimal sqlite3 CLI emulator — dot-command subset used by nsys_analyze.sh."""
+import sqlite3 as _sq, sys
+
+def _fv(v):
+    return '' if v is None else str(v)
+
+def _sv(v):
+    if v is None: return 'NULL'
+    if isinstance(v, (int, float)): return repr(v)
+    return "'" + str(v).replace("'", "''") + "'"
+
+def run(db, sql, sep, show_hdr):
+    con = _sq.connect(db)
+    mode, ins = 'list', 'tbl'
+    buf = []
+
+    def flush():
+        nonlocal buf
+        stmt = '\n'.join(buf).strip(); buf = []
+        if not stmt: return
+        try:
+            cur = con.execute(stmt)
+        except _sq.Error as e:
+            print(f'Error: {e}', file=sys.stderr); return
+        if not cur.description: return
+        cols = [d[0] for d in cur.description]
+        rows = cur.fetchall()
+        if mode == 'markdown':
+            print('| ' + ' | '.join(cols) + ' |')
+            print('|' + '|'.join('-' * (len(c) + 2) for c in cols) + '|')
+            for r in rows:
+                print('| ' + ' | '.join(_fv(v) for v in r) + ' |')
+        elif mode == 'insert':
+            for r in rows:
+                print(f"INSERT INTO {ins} VALUES({', '.join(_sv(v) for v in r)});")
+        else:
+            if show_hdr: print(sep.join(cols))
+            for r in rows: print(sep.join(_fv(v) for v in r))
+
+    for line in sql.splitlines():
+        s = line.strip()
+        if s.startswith('.'):
+            flush()
+            if s == '.mode markdown':
+                mode = 'markdown'; show_hdr = True
+            elif s.startswith('.mode insert'):
+                mode = 'insert'; p = s.split(None, 2); ins = p[2] if len(p) > 2 else 'tbl'
+            elif s == '.headers on':  show_hdr = True
+            elif s == '.headers off': show_hdr = False
+            elif s == '.print':       print()
+            elif s.startswith('.print '): print(s[7:])
+            # other dot commands (.bail, .nullvalue, …) are ignored
+        else:
+            buf.append(line)
+            if s.endswith(';'): flush()
+    flush()
+    con.close()
+
+def main():
+    av, sep, hdrs, db, sql = sys.argv[1:], '|', False, None, None
+    i = 0
+    while i < len(av):
+        a = av[i]
+        if a == '-separator':
+            i += 1; sep = av[i]
+        elif a == '-headers':
+            hdrs = True
+        elif not a.startswith('-'):
+            if db is None: db = a
+            else: sql = a
+        i += 1
+    if not db:
+        sys.exit('sqlite3: no database specified')
+    if sql is None and not sys.stdin.isatty():
+        sql = sys.stdin.read()
+    if sql:
+        run(db, sql, sep, hdrs)
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
+PYEOF
+    sqlite3() { "$_PY" "$_SQLITE3_PY" "$@"; }
+fi
+
 if [ $# -lt 1 ] || [ "$1" = "--help" ] || [ "$1" = "-h" ]; then
     echo "Usage: $0 <sqlite_file_or_directory> [query_numbers...]"
     echo ""
