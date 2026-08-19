@@ -30,6 +30,7 @@
 #include "op/sirius_physical_operator.hpp"
 #include "op/sirius_physical_operator_type.hpp"
 #include "op/sirius_physical_partition.hpp"
+#include "pipeline/repository_wiring.hpp"
 
 #include <algorithm>
 #include <functional>
@@ -58,9 +59,15 @@ pipeline_conversion_result sirius_pipeline_converter::convert(sirius_meta_pipeli
   finalize_pipeline_structure();
   link_join_partition_siblings();
   configure_partition_min_partitions();
+  restrict_dynamic_filter_replicas();
   // Must run after finalize_pipeline_structure (populates `dependencies`) and after
   // link_join_partition_siblings (reads dependencies[0]/[1] positionally pre-reorder).
   reorder_pipelines_topologically(scheduled_);
+
+  // Number the operators now that the pipeline set is final and topologically ordered. This is
+  // the one point every caller shares — the engine, and the plan-inspection paths that convert
+  // without building an engine — so no consumer can observe an unnumbered plan.
+  assign_operator_ids(scheduled_);
 
   return {std::move(scheduled_), std::move(repository_wirings_), meta_pipeline_count_};
 }
@@ -231,6 +238,18 @@ op::MemoryBarrierType sirius_pipeline_converter::resolve_barrier(
       return op::MemoryBarrierType::PARTIAL;
     }
   }
+  // A CONCAT feeding a HASH_JOIN drives the join's own "build"/"default" input ports. Make those
+  // ports PARTIAL so the join consumes build and probe batches progressively (partial barrier)
+  // rather than waiting (via the base FULL-barrier hint) for both upstream pipelines to finish. The
+  // hash join's overridden get_next_task_hint / get_next_task_input_data schedule per-partition
+  // build x probe pairs as batches arrive; the concat still folds whichever side must be seen whole
+  // (LEFT/SEMI/ANTI -> build, RIGHT-family -> probe, OUTER -> both) to a single batch, so results
+  // stay correct for every join type. BUILD_PROBE mode is unaffected (it overrides its hint
+  // regardless of the port barrier). See docs/super-sirius/operators.md.
+  if (sink.type == T::CONCAT && sink.get_parent_op() &&
+      sink.get_parent_op()->type == T::HASH_JOIN) {
+    return op::MemoryBarrierType::PARTIAL;
+  }
   return op::MemoryBarrierType::FULL;
 }
 
@@ -266,8 +285,8 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
 
     using T = op::SiriusPhysicalOperatorType;
 
-    // RESULT_COLLECTOR is a terminal sink — nothing to emit.
-    if (sink_op->type == T::RESULT_COLLECTOR) { continue; }
+    // Query-terminal: no wiring. is_query_terminal() shared with notify_downstream / executor.
+    if (pipeline->is_query_terminal()) { continue; }
 
     // CTE fans out to its sibling `cte_scans` (parent_op alone doesn't encode them).
     // CTE_SCAN never lands in any pipeline's operators[], so consumers resolve via
@@ -286,69 +305,31 @@ void sirius_pipeline_converter::compute_repository_wiring(sirius_pipeline_build_
       continue;
     }
 
-    // RIGHT_DELIM_JOIN: emit partition_join + distinct sibling references.
-    if (sink_op->type == T::RIGHT_DELIM_JOIN) {
-      auto& right_delim    = sink_op->Cast<op::sirius_physical_right_delim_join>();
-      auto* partition_join = right_delim.partition_join;
-      auto* distinct_op    = right_delim.distinct;
-      if (partition_join) {
-        auto it = dest_for_op.find(partition_join);
-        // partition_join executes inline in RIGHT_DELIM_JOIN::sink with no pipeline of
-        // its own, so the direct lookup misses; fall back to its tree parent
-        // (CONCAT_build), mirroring legacy's PARTITION → CONCAT build wiring.
-        if (it == dest_for_op.end()) {
-          if (auto* parent = partition_join->get_parent_op()) { it = dest_for_op.find(parent); }
-        }
-        if (it != dest_for_op.end()) {
-          emit("default", op::MemoryBarrierType::FULL, partition_join, pipeline, it->second);
-        }
+    // A delim join is a fan-out sink: its base sink() pushes each input batch to both branch
+    // pipelines, which are first-class pipelines sourced from the delim join. Emit one edge per
+    // branch with the delim join as the producer; the sub-ops' outward edges (PARTITION_build →
+    // CONCAT_build, DISTINCT → PARTITION_distinct, column_data_scan → PARTITION_probe) come from
+    // the uniform tree-parent lookup below.
+    if (sink_op->type == T::RIGHT_DELIM_JOIN || sink_op->type == T::LEFT_DELIM_JOIN) {
+      auto& delim = sink_op->Cast<op::sirius_physical_delim_join>();
+      // Branch 1: the side that feeds the inner join (RHS build / LHS probe).
+      op::sirius_physical_operator* join_side = nullptr;
+      if (sink_op->type == T::RIGHT_DELIM_JOIN) {
+        join_side = sink_op->Cast<op::sirius_physical_right_delim_join>().partition_join;
+      } else {
+        join_side = sink_op->Cast<op::sirius_physical_left_delim_join>().column_data_scan;
       }
-      if (distinct_op) {
-        auto it = dest_for_op.find(distinct_op);
-        // The bare DISTINCT also executes inline (`_owned_by_delim_join` short-circuits
-        // its build_pipelines), so the direct lookup misses; fall back to its tree
-        // parent (PARTITION_distinct), which consumes its per-thread output.
-        if (it == dest_for_op.end()) {
-          if (auto* parent = distinct_op->get_parent_op()) { it = dest_for_op.find(parent); }
-        }
-        if (it != dest_for_op.end()) {
-          emit("default", op::MemoryBarrierType::FULL, distinct_op, pipeline, it->second);
-        }
-      }
-      continue;
-    }
-
-    // LEFT_DELIM_JOIN: emit column_data_scan + distinct sibling references.
-    if (sink_op->type == T::LEFT_DELIM_JOIN) {
-      auto& left_delim       = sink_op->Cast<op::sirius_physical_left_delim_join>();
-      auto* distinct_op      = left_delim.distinct;
-      auto* column_data_scan = left_delim.column_data_scan;
-      if (column_data_scan) {
-        auto it = dest_for_op.find(column_data_scan);
-        // column_data_scan executes inline in LEFT_DELIM_JOIN::sink (build_pipelines is a
-        // no-op), so the direct lookup misses; fall back to its tree parent (PARTITION_probe).
-        // resolve_barrier lets the dest dictate PARTIAL for the probe-side partition.
-        if (it == dest_for_op.end()) {
-          if (auto* parent = column_data_scan->get_parent_op()) { it = dest_for_op.find(parent); }
-        }
-        if (it != dest_for_op.end()) {
-          emit("default",
-               resolve_barrier(*column_data_scan, *it->second),
-               column_data_scan,
-               pipeline,
-               it->second);
-        }
-      }
-      if (distinct_op) {
-        auto it = dest_for_op.find(distinct_op);
-        // Same fallback as RIGHT_DELIM_JOIN's bare DISTINCT: no pipeline of its own,
-        // so resolve to its tree parent (PARTITION_distinct).
-        if (it == dest_for_op.end()) {
-          if (auto* parent = distinct_op->get_parent_op()) { it = dest_for_op.find(parent); }
-        }
-        if (it != dest_for_op.end()) {
-          emit("default", op::MemoryBarrierType::FULL, distinct_op, pipeline, it->second);
-        }
+      // Branch 2: the duplicate-elimination (distinct) side.
+      op::sirius_physical_operator* distinct_op = delim.distinct;
+      for (auto* branch : {join_side, distinct_op}) {
+        if (!branch) { continue; }
+        auto it = dest_for_op.find(branch);
+        if (it == dest_for_op.end()) { continue; }
+        emit(resolve_port_id(*sink_op, *branch),
+             resolve_barrier(*sink_op, *it->second),
+             sink_op,
+             pipeline,
+             it->second);
       }
       continue;
     }
@@ -470,58 +451,81 @@ void sirius_pipeline_converter::link_join_partition_siblings()
       D_ASSERT(
         build_concat_pipeline->get_sink()->type == op::SiriusPhysicalOperatorType::CONCAT &&
         build_concat_pipeline->get_sink()->Cast<op::sirius_physical_concat>().is_build_concat());
-      bool const is_right_delim = build_partition_pipeline->get_sink()->type ==
-                                  op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
-      // RIGHT_DELIM_JOIN must bootstrap its probe subtree from build-side distinct data.
+      // A RIGHT_DELIM_JOIN's inner join bootstraps its probe subtree from build-side (distinct)
+      // data, so the build side drives the partition count. Detect it off the join's tree parent
+      // (the same predicate resolve_barrier uses), since the build partition is a plain PARTITION
+      // that the sink type alone does not distinguish.
+      bool const inner_join_of_rdj =
+        pipeline->source->get_parent_op() != nullptr &&
+        pipeline->source->get_parent_op()->type == op::SiriusPhysicalOperatorType::RIGHT_DELIM_JOIN;
       // Right-family sizing applies to hash joins only — NLJ probe partitions always stream.
       bool const probe_drives_partition_count =
         pipeline->source->type == op::SiriusPhysicalOperatorType::HASH_JOIN &&
         pipeline->source->Cast<op::sirius_physical_hash_join>().is_right_family() &&
-        !is_right_delim;
+        !inner_join_of_rdj;
 
-      if (is_right_delim) {
-        // partition pipeline only has one operator
-        auto& right_delim_join_op =
-          build_partition_pipeline->get_sink()->Cast<op::sirius_physical_right_delim_join>();
-        auto build_partition_op = right_delim_join_op.partition_join;
-        auto& probe_partition_op =
-          probe_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
-        build_partition_op->set_sibling_partition_op(&probe_partition_op);
-        probe_partition_op.set_sibling_partition_op(build_partition_op);
-      } else {
-        // partition pipeline only has one operator, so sink and source are the same
-        auto& build_partition_op =
-          build_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
-        auto& probe_partition_op =
-          probe_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
-        build_partition_op.set_sibling_partition_op(&probe_partition_op);
-        probe_partition_op.set_sibling_partition_op(&build_partition_op);
-        if (probe_drives_partition_count) {
-          build_partition_op.set_drives_partition_count(false);
-          probe_partition_op.set_drives_partition_count(true);
-        }
+      // partition pipeline only has one operator, so sink and source are the same
+      auto& build_partition_op =
+        build_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
+      auto& probe_partition_op =
+        probe_partition_pipeline->get_sink()->Cast<op::sirius_physical_partition>();
+      build_partition_op.set_sibling_partition_op(&probe_partition_op);
+      probe_partition_op.set_sibling_partition_op(&build_partition_op);
+      if (probe_drives_partition_count) {
+        build_partition_op.set_drives_partition_count(false);
+        probe_partition_op.set_drives_partition_count(true);
       }
+    }
+  }
+}
+
+void sirius_pipeline_converter::restrict_dynamic_filter_replicas()
+{
+  auto const& admitted = build_ctx_.active_gpu_ids();
+  if (admitted.empty()) return;
+
+  auto apply_to_op = [&](op::sirius_physical_operator* op) {
+    if (auto* join = dynamic_cast<op::sirius_physical_hash_join*>(op)) {
+      join->restrict_dynamic_filter_replicas(admitted);
+    }
+  };
+  for (auto& pipe : scheduled_) {
+    if (!pipe) continue;
+    auto sink   = pipe->get_sink();
+    auto source = pipe->get_source();
+    if (sink) apply_to_op(sink.get());
+    if (source) apply_to_op(source.get());
+    // A join is not always a pipeline boundary — fusion can leave one among the intermediate
+    // operators, where source/sink alone would miss it. Restriction is idempotent, so an
+    // operator reached twice is harmless.
+    for (auto op_ref : pipe->get_operators()) {
+      apply_to_op(&op_ref.get());
     }
   }
 }
 
 void sirius_pipeline_converter::configure_partition_min_partitions()
 {
-  // Pull num_gpus from the build context (populated from sirius_engine's
-  // hardware topology at convert time). Single-GPU runs keep the default
-  // min of 1 (no-op). For multi-GPU we force a floor equal to num_gpus on
-  // big-enough inputs; small_table_bytes keeps tiny aggregations on a
-  // single GPU to avoid cross-device overhead.
+  // Pull num_gpus from the build context (derived from sirius_engine's configured GPU set at
+  // convert time). Single-GPU runs keep the consumer default of 1 (no-op). For multi-GPU we hand
+  // num_gpus to each partition's downstream sizing consumer, which derives the partition floor and
+  // small-table threshold internally (see natural_num_partitions / partition_small_table_bytes) and
+  // lets joins keep one hash table per partition so BUILD_PROBE is admitted for up to num_gpus
+  // partitions rather than only one.
   const int num_gpus = build_ctx_.num_gpus();
   if (num_gpus <= 1) return;
-  // Heuristic threshold: below ~16 MiB per GPU the partition overhead
-  // dominates. Configurable later if we find a workload where this matters.
-  const uint64_t small_table_bytes = static_cast<uint64_t>(num_gpus) * uint64_t{16} * 1024 * 1024;
 
   auto apply_to_op = [&](op::sirius_physical_operator* op) {
-    if (op && op->type == op::SiriusPhysicalOperatorType::PARTITION) {
-      static_cast<op::sirius_physical_partition*>(op)->set_min_num_partitions(num_gpus,
-                                                                              small_table_bytes);
+    if (!op) return;
+    if (op->type != op::SiriusPhysicalOperatorType::PARTITION) return;
+    auto* partition_op = static_cast<op::sirius_physical_partition*>(op);
+    // The active GPU id list lets broadcast partitioning map a probe batch's residence GPU to its
+    // partition slot (inverse of task_creator's partition_idx -> GPU routing).
+    partition_op->set_active_gpu_ids(build_ctx_.active_gpu_ids());
+    // Inform the downstream sizing consumer (hash join / NLJ / merge) of the GPU count.
+    if (auto* consumer = dynamic_cast<op::sirius_physical_partition_consumer_operator*>(
+          partition_op->get_downstream_consumer_op())) {
+      consumer->set_num_gpus(num_gpus);
     }
   };
   for (auto& pipe : scheduled_) {
@@ -553,12 +557,12 @@ std::string dump_barrier_name(op::MemoryBarrierType b)
 //! Scan identity: serialize what the ingestible will scan, so a conversion that drops
 //! identity fields (e.g. the duckdb-native pin-cache qualified name, or a parquet file
 //! list) fails the dump byte-diff instead of passing on an identical operator-type chain.
-//! Conversion-time only: table_info is still parked on the operator (scan_manager takes it
-//! at prepare_for_query).
+//! The operator owns its ingestible for the whole query, so this reads the same table_info
+//! the scan manager later matches against pinned entries.
 void dump_scan_identity(std::ostringstream& out, const op::sirius_physical_operator& op)
 {
   if (op.type != op::SiriusPhysicalOperatorType::GPU_SCAN) { return; }
-  auto const& info = op.Cast<op::scan::sirius_gpu_scan_operator>().peek_table_info();
+  auto const& info = op.Cast<op::scan::sirius_gpu_scan_operator>().get_ingestible().table_info();
   if (auto const* pq = dynamic_cast<op::scan::parquet_ingestible_table_info const*>(&info)) {
     out << "      scan: parquet files=[";
     for (std::size_t f = 0; f < pq->resolved_file_paths.size(); ++f) {

@@ -104,26 +104,11 @@ class gpu_pipeline_task_local_state : public sirius_pipeline_task_local_state {
    * Counts inputs that are not GPU-resident (host/disk upgrades) and, when @p target_space is
    * given, GPU-resident inputs living in a different memory space — those are cloned into the
    * target space by lock_or_prepare_batch, so their bytes are part of the task's footprint.
+   * Resident scan inputs cached in HOST are also counted, since they require an upload before
+   * execution.
    */
   [[nodiscard]] std::size_t get_estimated_bytes_to_materialize_input(
-    const cucascade::memory::memory_space* target_space) const
-  {
-    std::size_t input_size = 0;
-    auto* pipelineable_input =
-      dynamic_cast<const op::pipelineable_operator_data*>(_input_data.get());
-    if (pipelineable_input) {
-      for (const auto& ro : pipelineable_input->get_read_only_batches(false)) {
-        if (!ro.get_data()) { continue; }
-        const bool non_gpu     = ro.get_current_tier() != cucascade::memory::Tier::GPU;
-        const bool cross_space = target_space != nullptr && ro.get_memory_space() != nullptr &&
-                                 ro.get_memory_space()->get_id() != target_space->get_id();
-        if (non_gpu || cross_space) {
-          input_size += ro.get_data()->get_uncompressed_data_size_in_bytes();
-        }
-      }
-    }
-    return input_size;
-  }
+    const cucascade::memory::memory_space* target_space) const;
 
  private:
   std::optional<int> _preferred_device_id;  ///< Preferred GPU device based on data locality
@@ -179,6 +164,24 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
       return gs->get_preferred_device_id();
     }
     return std::nullopt;
+  }
+
+  /**
+   * @brief Get the scheduling priority for this task.
+   *
+   * Priority is a pipeline-level property carried on the shared global state, so every task of a
+   * pipeline reports the same value. Lower priority values are dispatched first by the pipeline-
+   * level priority queue (priority ascends with execution order). Defaults to 0 when no global
+   * state is attached.
+   *
+   * @return The scheduling priority for this task.
+   */
+  [[nodiscard]] exec::queue_priority get_priority() const
+  {
+    if (auto gs = std::dynamic_pointer_cast<const gpu_pipeline_task_global_state>(_global_state)) {
+      return gs->get_priority();
+    }
+    return 0;
   }
 
   /**
@@ -262,6 +265,13 @@ class gpu_pipeline_task : public sirius_pipeline_itask {
   /// weak_ptr so that memory can be released as soon as the last owner drops.
   /// This is used in the destructor to unsubscribe.
   std::vector<std::weak_ptr<cucascade::data_batch>> _subscribed_batches;
+  //! Batch ids claimed for telemetry in the constructor; released by id in the
+  //! dtor because the weak pointers above are usually dead by then.
+  std::vector<uint64_t> _claimed_batch_ids;
+  //! The processing-space reservation reported on the preparing/computing
+  //! telemetry states as a MemoryTier usage (nil id = none).
+  uuid::UUID _reservation_tier_resource_id{};
+  uint64_t _reservation_bytes = 0;
 };
 
 }  // namespace pipeline

@@ -94,6 +94,10 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
     return indices;
   }
 
+  //! Runtime schema of the local COUNT(DISTINCT) accumulator. The local aggregate and PARTITION
+  //! carry LIST sets; MERGE_GROUP_BY later converts those sets to the declared BIGINT count.
+  [[nodiscard]] duckdb::vector<sirius::logical_type> get_count_distinct_local_output_types() const;
+
   // Source interface
   bool is_source() const override { return true; }
 
@@ -107,20 +111,8 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
 
   bool sink_order_dependent() const override { return false; }
 
-  //! True when this HASH_GROUP_BY is the bare DISTINCT of a RIGHT_DELIM_JOIN (set at
-  //! plan-gen time). The delim join's sink executes it inline, never via its own
-  //! pipeline, so `build_pipelines` suppresses pipeline materialization under flag ON.
-  [[nodiscard]] bool is_owned_by_delim_join() const noexcept { return _owned_by_delim_join; }
-  void set_owned_by_delim_join(bool value) noexcept { _owned_by_delim_join = value; }
-
-  void build_pipelines(pipeline::sirius_pipeline& current,
-                       pipeline::sirius_meta_pipeline& meta_pipeline) override;
-
   std::unique_ptr<operator_data> execute(const operator_data& input_data,
                                          rmm::cuda_stream_view stream) override;
-
- protected:
-  bool _owned_by_delim_join = false;
 };
 
 }  // namespace op

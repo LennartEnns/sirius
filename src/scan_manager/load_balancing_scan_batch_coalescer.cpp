@@ -52,6 +52,10 @@ void load_balancing_scan_batch_coalescer::use_cached_entries_for_pipeline(
   auto it  = _slots.find(uid);
   if (it == _slots.end()) { return; }
   auto& state = *it->second;
+  // Cached batches always reach post_filter_and_project unfiltered, so the
+  // op's row filter (when present) runs against every drained split — record
+  // that so each split's working-set estimate covers the filter-by-copy peak.
+  state.row_filter_pending = scan_op->get_ingestible().has_row_filter();
   state.attach_batch_provider(std::move(provider));
 }
 
@@ -93,9 +97,6 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
   auto emit = [&state](std::unique_ptr<op::scan::scan_info> batch) {
     auto op_data = std::make_unique<op::scan::scan_operator_input>(std::move(batch));
     auto dev_id  = state.balancer->get_next_gpu(state.pipeline_id, op_data.get());
-    SIRIUS_LOG_DEBUG("[coalesce-debug] load_balancer emit pipeline={} -> preferred GPU {}",
-                     state.pipeline_id,
-                     dev_id.has_value() ? dev_id.value() : -1);
     if (dev_id.has_value() && *dev_id >= 0) { op_data->set_preferred_device_id(dev_id.value()); }
 
     auto fadvise_hints = op_data->get_fadvise_hints();
@@ -164,18 +165,49 @@ void load_balancing_scan_batch_coalescer::process_provider_inputs(metadata_proce
 void load_balancing_scan_batch_coalescer::process_cached_entries(metadata_processing_state& state,
                                                                  std::stop_token const& stop)
 {
-  drain_cached_provider(*state.batch_provider, *state.connector, stop);
+  drain_cached_provider(*state.batch_provider, *state.connector, stop, state.row_filter_pending);
 }
 
 void load_balancing_scan_batch_coalescer::drain_cached_provider(databatch_provider& provider,
                                                                 split_connector& connector,
-                                                                std::stop_token const& stop)
+                                                                std::stop_token const& stop,
+                                                                bool row_filter_pending)
 {
   try {
     while (!stop.stop_requested()) {
-      auto databatch = provider.get_next_batch();
-      if (!databatch) { break; }
-      connector.push_split(std::make_unique<op::scan::scan_operator_input>(std::move(databatch)));
+      auto next = provider.get_next_batch();
+      if (next.data) {
+        auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.data));
+        split->mvcc_keep_mask               = std::move(next.mvcc_keep_mask);
+        split->needs_carrier_conversion     = next.needs_carrier_conversion;
+        split->conversion_destination_bytes = next.conversion_destination_bytes;
+        split->row_filter_pending           = row_filter_pending;
+        connector.push_split(std::move(split));
+        continue;
+      }
+      if (next.scan_info) {
+        // Insert-delta split. row_filter_pending stays false: scan_info
+        // splits fold filter costs into their own estimates. Same fadvise +
+        // opportunistic prefetch as the walk path; host-backed splits have
+        // no file ranges, so the hints no-op.
+        auto split = std::make_unique<op::scan::scan_operator_input>(std::move(next.scan_info));
+        split->mvcc_keep_mask = std::move(next.mvcc_keep_mask);
+        std::optional<int> device;
+        if (next.preferred_device >= 0) {
+          device = next.preferred_device;
+          split->set_preferred_device_id(next.preferred_device);
+        }
+        auto fadvise_hints = split->get_fadvise_hints();
+        for (auto& hint : fadvise_hints) {
+          if (hint.datasource && !hint.ranges.empty()) {
+            hint.datasource->fadvise(hint.ranges, device);
+          }
+        }
+        split->prefetch(io::cache::prefetching_stage::opportunistic);
+        connector.push_split(std::move(split));
+        continue;
+      }
+      break;  // end-of-stream
     }
     connector.close();
   } catch (...) {

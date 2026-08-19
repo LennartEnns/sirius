@@ -163,6 +163,7 @@ static bool can_use_partitioned_aggregate(duckdb::ClientContext& context,
         for (auto& partition_col : partition_columns) {
           // we only support bound reference here
           auto const* expr = projection.select_list[partition_col].get();
+          if (expr == nullptr) { return false; }
           if (!expr->holds<sirius::ast::reference>()) { return false; }
           new_columns.push_back(expr->get<sirius::ast::reference>().column_index);
         }
@@ -328,6 +329,12 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 
   // Downcast HUGEINT to BIGINT since cuDF does not support int128
   downcast_hugeint_types(op.types, op.expressions);
+
+  // Reject nested GROUP BY keys before extract_aggregate_expressions rewrites
+  // groups into bare references (which lose the name needed for the error).
+  for (auto const& group : op.groups) {
+    reject_nested_column_operation(*group, "GROUP BY");
+  }
 
   auto plan = create_plan(*op.children[0]);
 

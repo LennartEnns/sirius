@@ -24,8 +24,9 @@ BUILD_TARGETS := $(MAIN_BUILD_TARGETS) $(TEST_BUILD_TARGET)
 	clang-release clang-debug clang-relwithdebinfo clang-asan clang-tsan \
 	ci-release configure_ci set_duckdb_version \
 	test test_release test_debug test_reldebug test_ci-release clean list-presets \
-	s3-test s3-test-large \
-	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker s3-bench
+	s3-test s3-test-large s3-tpch \
+	s3-test-aws s3-test-aws-sigv4 s3-test-aws-broker s3-bench \
+	slot-gate-test
 
 PRESETS_LINK := $(DUCKDB_DIR)/CMakePresets.json
 
@@ -148,6 +149,27 @@ list-presets: $(PRESETS_LINK)
 
 S3_TEST_BIN ?= build/release/extension/sirius/test/cpp/sirius_unittest
 
+# Query-lifecycle concurrency gates. Runs the hidden [slot_leak_gate] cases
+# (the worker-pressure gate needs a TPC-H lineitem parquet fixture) plus the
+# concurrent keyed-log segmentation check driven through tools/log_analyzer.
+# Manual gate for lifecycle/logging changes; not wired into any CI workflow.
+# The fixture check is loud on purpose: the hidden cases fail hard when the
+# fixture is missing, so a mis-provisioned run must not look green.
+SLOT_GATE_TPCH_DIR ?= test_datasets/tpch_parquet
+
+slot-gate-test:
+	@if [ ! -x $(S3_TEST_BIN) ]; then \
+	  echo "slot-gate-test: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@if [ ! -f $(SLOT_GATE_TPCH_DIR)/lineitem.parquet ]; then \
+	  echo "slot-gate-test: $(SLOT_GATE_TPCH_DIR)/lineitem.parquet missing - export TPC-H SF1 lineitem there or set SLOT_GATE_TPCH_DIR" >&2; \
+	  exit 1; \
+	fi
+	@set -e; \
+	SIRIUS_TEST_TPCH_DIR=$(SLOT_GATE_TPCH_DIR) $(S3_TEST_BIN) "[slot_leak_gate]"; \
+	python3 tools/log_analyzer/verify_query_lifecycle_segments.py
+
 s3-test:
 	@if [ ! -x $(S3_TEST_BIN) ]; then \
 	  echo "s3-test: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
@@ -166,10 +188,25 @@ s3-test-large:
 	@# group. Catch2 OR-combines specs within one argument via commas (multiple
 	@# positional args are AND-concatenated instead), so each group runs in a
 	@# single process where same-config cases share one SiriusContext lifecycle.
+	@# SIRIUS_TEST_S3_TPCH gates the SF1 TPC-H fixture + [tpch][large]; SIRIUS_TEST_S3_GLOB_SCALE
+	@# gates the 1001-object fixture + [glob-scale]. Both are scoped to the first group only, so
+	@# the second group's bring-up must not see them (it would re-generate / re-upload).
 	@set -e; \
 	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1 SIRIUS_TEST_S3_STRICT=1; \
-	$(S3_TEST_BIN) "[s3][sql][large][large-count],[s3][sql][large][large-q1],[s3][sql][large][large-join]"; \
+	SIRIUS_TEST_S3_TPCH=1 SIRIUS_TEST_S3_GLOB_SCALE=1 $(S3_TEST_BIN) "[s3][sql][large][large-count],[s3][sql][large][large-q1],[s3][sql][large][large-join],[s3][integration][sql][tpch][large],[s3][large][glob-scale]"; \
 	$(S3_TEST_BIN) "[s3][sql][large][large-count-no-prewarm],[s3][sql][large][large-q1-no-prewarm],[s3][sql][large][large-join-no-prewarm]"
+
+# TPC-H-over-S3 correctness tier (Q1-Q22 == local CPU oracle, GPU-only). Uploads
+# the SF1 TPC-H fixture (SIRIUS_TEST_S3_TPCH=1) and runs both the tiny and SF1
+# correctness cases; excludes the [bench] perf arm. MinIO auto-managed.
+s3-tpch:
+	@if [ ! -x $(S3_TEST_BIN) ]; then \
+	  echo "s3-tpch: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
+	  exit 1; \
+	fi
+	@set -e; \
+	export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_STRICT=1 SIRIUS_TEST_S3_TPCH=1; \
+	$(S3_TEST_BIN) "[s3][integration][sql][tpch]~[bench]"
 
 # Manual real-AWS gates. These never start MinIO/Docker and are excluded from
 # CI. Export the AWS environment yourself before invoking (regional S3 endpoint,
@@ -225,12 +262,17 @@ s3-bench:
 	  echo "s3-bench: $(S3_TEST_BIN) not found - run \`make release\` first" >&2; \
 	  exit 1; \
 	fi
+	@# The TPC-H query benchmark ([s3][bench][tpch]) is excluded from the routine
+	@# run and its SF1 fixture (SIRIUS_TEST_S3_TPCH) is not uploaded, unless the
+	@# caller opts in with SIRIUS_BENCH_S3_TPCH=1.
 	@set -e; \
+	tpch_excl="~[tpch]"; \
+	if [ -n "$${SIRIUS_BENCH_S3_TPCH:-}" ]; then tpch_excl=""; fi; \
 	if [ "$${SIRIUS_BENCH_BACKEND:-minio}" = "minio" ]; then \
 	  export SIRIUS_TEST_S3_AUTO=1 SIRIUS_TEST_S3_LARGE=1 SIRIUS_TEST_S3_STRICT=1; \
-	  selector="[s3][bench]~[aws]"; \
+	  selector="[s3][bench]~[aws]$$tpch_excl"; \
 	else \
-	  selector="[s3][bench][aws]"; \
+	  selector="[s3][bench][aws]$$tpch_excl"; \
 	fi; \
 	export SIRIUS_BENCH_GIT_SHA="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
 	export HOSTNAME="$${HOSTNAME:-$$(hostname)}"; \

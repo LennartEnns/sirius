@@ -93,6 +93,17 @@ find_package(yaml-cpp REQUIRED CONFIG)
 find_package(absl REQUIRED CONFIG)
 find_package(PkgConfig REQUIRED)
 find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
+
+# Static NVRTC (vcpkg overlay port). Statically linking the runtime JIT compiler
+# keeps libnvrtc.so out of the distributed extension's runtime dependencies.
+# Like cuco/nvcomp, this is gated on the vcpkg build: the overlay port provides
+# the nvrtc::nvrtc_static target, which simpatico links instead of the bare
+# 'nvrtc' library name (see src/compression/simpatico_codegen/CMakeLists.txt).
+# The pixi build has no such target and links the conda shared libnvrtc.so.
+if(VCPKG_BUILD)
+  find_package(nvrtc CONFIG REQUIRED)
+endif()
 
 # --- cuCollections (cuco) --- #
 
@@ -157,6 +168,12 @@ set(CUCASCADE_BUILD_IO
     CACHE BOOL "" FORCE)
 add_subdirectory(cucascade "${CMAKE_BINARY_DIR}/cucascade" EXCLUDE_FROM_ALL)
 
+# Simpatico GPU compression engine Tests disabled here — run them via the
+# standalone simpatico_codegen build. Benchmark harness
+# (compress_with_plan_benchmark) is built by default.
+add_subdirectory(src/compression/simpatico_codegen
+                 "${CMAKE_BINARY_DIR}/simpatico_codegen" EXCLUDE_FROM_ALL)
+
 if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
   function(sirius_prefer_static_cudart target_name)
     foreach(_prop LINK_LIBRARIES INTERFACE_LINK_LIBRARIES)
@@ -188,6 +205,19 @@ if(VCPKG_BUILD AND TARGET CUDA::cudart_static)
       sirius_prefer_static_cudart("${_target}")
     endif()
   endforeach()
+
+  # cucascade's topology discovery gained rmm includes (NUMA capacity
+  # detection), so it needs the same vcpkg-over-toolkit include priority as
+  # sirius's own rapids consumers: without it GCC drops the duplicated vcpkg -I
+  # in favor of the later -isystem, the CUDA toolkit's CCCL wins the search
+  # order, and CUDA 12's bundled CCCL (< 3.3) trips rmm's version check. Only
+  # the object target compiles TUs; the static wrapper just links the objects.
+  if(TARGET cucascade_topology_discovery_objects)
+    set_target_properties(cucascade_topology_discovery_objects
+                          PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
+    target_include_directories(cucascade_topology_discovery_objects BEFORE
+                               PRIVATE ${_VCPKG_INC})
+  endif()
 endif()
 
 # Rust telemetry instrumentation (C++ FFI via Corrosion)
@@ -204,13 +234,17 @@ endif()
 
 # cmake-format: off
 set(EXTENSION_SOURCES
+    src/compression/compressed_representation.cpp
+    src/compression/compression_converters.cpp
+    src/compression/plan_register.cpp
     src/config.cpp
-    src/helper/list_offset_fixup.cpp
+    src/helper/numeric_narrowing.cpp
     src/helper/type_conversions.cpp
     src/debug_utils.cpp
     src/creator/task_creator.cpp
     src/downgrade/downgrade_executor.cpp
     src/expression/aggregate_id.cpp
+    src/expression/ast/constant_range.cpp
     src/expression/ast/node.cpp
     src/expression/ast/utils.cpp
     src/expression/from_duckdb.cpp
@@ -230,10 +264,13 @@ set(EXTENSION_SOURCES
     src/expression_evaluator/specializations/conjunction.cpp
     src/expression_evaluator/specializations/constant.cpp
     src/expression_evaluator/specializations/function.cpp
+    src/expression_evaluator/specializations/narrow_domain.cpp
     src/expression_evaluator/specializations/operator.cpp
     src/expression_evaluator/specializations/reference.cpp
     # Execution primitives (slot-based backpressure / completion tracking)
     src/exec/admission_control.cpp
+    src/exec/batch_stream.cpp
+    src/exec/stream_session.cpp
     # I/O adapters (Phase 19 — io_uring + sirius_datasource)
     src/io/datasource_factory.cpp
     src/io/io_context.cpp
@@ -247,12 +284,17 @@ set(EXTENSION_SOURCES
     src/io/rest/curl_handle.cpp
     src/io/rest/rest_ioctx.cpp
     src/io/rest/rest_reactor.cpp
+    src/io/s3/s3_list_parser.cpp
     src/io/s3/sigv4.cpp
     src/io/s3/sirius_httpfs.cpp
     src/io/s3/sirius_sigv4_authorizer.cpp
     src/io/uring/uring_ioctx.cpp
     src/io/uring/uring_reactor.cpp
+    src/log/duckdb_sink.cpp
+    src/log/level.cpp
     src/log/logging.cpp
+    src/log/noop_sink.cpp
+    src/log/spdlog_owning_sink.cpp
     src/memory/defragmenter_oom_policy.cpp
     src/memory/sirius_memory_reservation_manager.cpp
     src/op/aggregate/aggregate_op_util.cpp
@@ -262,10 +304,13 @@ set(EXTENSION_SOURCES
     src/op/partition/gpu_partition_impl.cpp
     src/op/result/host_table_chunk_reader.cpp
     src/op/scan/cached_ranges.cpp
+    src/op/scan/duckdb_insert_delta.cpp
+    src/op/scan/duckdb_mvcc_visibility.cpp
     src/op/scan/duckdb_native_metadata.cpp
     src/op/scan/duckdb_native_decoder.cpp
     src/op/scan/dynamic_filter_merge.cpp
     src/op/scan/sirius_physical_dynamic_filter.cpp
+    src/op/scan/host_keep_mask.cpp
     src/op/scan/owning_table_view.cpp
     src/op/scan/parquet_schema_mapping.cpp
     src/op/scan/scan_plan.cpp
@@ -279,6 +324,7 @@ set(EXTENSION_SOURCES
     src/op/dynamic_filter_publisher.cpp
     src/op/sirius_dynamic_filter.cpp
     src/op/sirius_physical_column_data_scan.cpp
+    src/op/sirius_physical_streaming_sink.cpp
     src/op/sirius_physical_streaming_source.cpp
     src/op/sirius_physical_concat.cpp
     src/op/sirius_physical_cte.cpp
@@ -316,11 +362,15 @@ set(EXTENSION_SOURCES
     src/pipeline/repository_wiring_materializer.cpp
     src/pipeline/sirius_plan_printer.cpp
     src/pipeline/task_request.cpp
+    src/planner/duckdb_join_filter_candidate_adapter.cpp
+    src/planner/gpu_admission.cpp
     src/planner/query.cpp
+    src/planner/query_index.cpp
     src/planner/sirius_physical_plan_generator.cpp
     src/planner/sirius_plan_aggregate.cpp
     src/planner/sirius_plan_column_data_get.cpp
     src/planner/sirius_plan_comparison_join.cpp
+    src/planner/sirius_plan_compressed_schema.cpp
     src/planner/sirius_plan_cte.cpp
     src/planner/sirius_plan_delim_get.cpp
     src/planner/sirius_plan_delim_join.cpp
@@ -330,6 +380,7 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_filter.cpp
     src/planner/sirius_plan_get.cpp
     src/planner/sirius_plan_limit.cpp
+    src/planner/sirius_plan_narrowing_policy.cpp
     src/planner/sirius_plan_order.cpp
     src/planner/sirius_plan_projection.cpp
     src/planner/sirius_plan_projection_utils.cpp
@@ -337,8 +388,11 @@ set(EXTENSION_SOURCES
     src/planner/sirius_plan_top_n.cpp
     src/pin_table.cpp
     src/scan_manager/load_balancing_scan_batch_coalescer.cpp
+    src/scan_manager/insert_delta_job.cpp
+    src/scan_manager/mvcc_mask_job.cpp
     src/scan_manager/pinned_chunk_stats.cpp
     src/scan_manager/round_robin_strategy.cpp
+    src/scan_manager/memory_prefetcher.cpp
     src/scan_manager/sirius_scan_manager.cpp
     src/scan_manager/split_connector.cpp
     src/scan_manager/split_provider.cpp
@@ -349,6 +403,7 @@ set(EXTENSION_SOURCES
     src/sirius_ffi.cpp
     src/sirius_interface.cpp
     src/sirius_sql_rewrite.cpp
+    src/telemetry/batch_telemetry.cpp
     src/telemetry/telemetry_context.cpp
     src/telemetry/memory_context.cpp
     src/transparent/physical_sirius_execution.cpp
@@ -361,9 +416,11 @@ set(EXTENSION_SOURCES
 
 # Deleting src/legacy/ cleanly removes legacy build support.
 set(CUDA_SOURCES
+    src/op/partition/crc32_partition_hash.cu
     src/cuda/dynamic_filter_replica_transfer.cu
     src/cuda/sirius_dynamic_bloom_filter.cu
     src/cuda/sirius_dynamic_in_list_filter.cu
+    src/cuda/sirius_dynamic_small_in_list_filter.cu
     src/cuda/scan/gpu_decode_alp.cu
     src/cuda/scan/gpu_decode_bitpacking.cu
     src/cuda/scan/gpu_decode_rle.cu
@@ -409,6 +466,12 @@ list(APPEND EXTENSION_SOURCES ${SIRIUS_SUBSTRAIT_SOURCES})
 build_static_extension(sirius ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 
+# The standalone FFI constructs an embedded DuckDB, which needs the no-op static
+# extension loader retained regardless of archive ordering.
+set_property(
+  TARGET sirius_loadable_extension
+  PROPERTY LINK_LIBRARY_OVERRIDE_dummy_static_extension_loader WHOLE_ARCHIVE)
+
 # rapidsai/rmm#826: DuckDB links the loadable extension with
 # -Wl,--exclude-libs,ALL, under which mold (but not bfd) hides RMM's GNU_UNIQUE
 # current-device-resource registry symbols, so cuDF's internal allocations
@@ -417,6 +480,9 @@ build_loadable_extension(sirius CPP ${EXTENSION_SOURCES} ${CUDA_SOURCES})
 set_target_properties(sirius_loadable_extension PROPERTIES LINKER_TYPE BFD)
 
 # Shared configuration for both extension targets
+set(SIRIUS_CLANG_CXX_WARNING_OPTIONS -Wunreachable-code -Wimplicit-fallthrough
+                                     -Wrange-loop-analysis -Wnull-dereference)
+
 foreach(_target sirius_extension sirius_loadable_extension)
   set_target_properties(
     ${_target}
@@ -431,7 +497,10 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # consumers (tests/benchmarks) with --expt-extended-lambda.
   target_compile_options(
     ${_target}
-    PRIVATE $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>)
+    PRIVATE
+      $<$<COMPILE_LANG_AND_ID:CUDA,NVIDIA>:--expt-extended-lambda>
+      "$<$<COMPILE_LANG_AND_ID:CXX,Clang,AppleClang>:${SIRIUS_CLANG_CXX_WARNING_OPTIONS}>"
+  )
 
   if(VCPKG_BUILD)
     set_target_properties(${_target} PROPERTIES CUDA_RUNTIME_LIBRARY Static)
@@ -450,6 +519,8 @@ foreach(_target sirius_extension sirius_loadable_extension)
     ${_target}
     PRIVATE
       $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
+      $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/compression/simpatico_codegen/include>
       $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
   )
 
@@ -457,7 +528,9 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # protobuf.
   target_include_directories(
     ${_target}
-    PRIVATE ${SIRIUS_SUBSTRAIT_DIR}/src/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/extension/core_functions/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/duckdb/extension/parquet/include
+            ${SIRIUS_SUBSTRAIT_DIR}/src/include
             ${SIRIUS_SUBSTRAIT_DIR}/third_party
             ${SIRIUS_SUBSTRAIT_DIR}/third_party/substrait)
 
@@ -469,6 +542,7 @@ foreach(_target sirius_extension sirius_loadable_extension)
   # cuCascade::cucascade_cudf holds the cudf-coupled representations and
   # converters Sirius uses; it transitively links the cudf-free core
   # (cuCascade::cucascade) and cudf::cudf.
+
   target_link_libraries(
     ${_target}
     cudf::cudf
@@ -478,7 +552,10 @@ foreach(_target sirius_extension sirius_loadable_extension)
     cuCascade::cucascade
     cuCascade::cucascade_cudf
     yaml-cpp::yaml-cpp
-    telemetry_bridge)
+    telemetry_bridge
+    core_functions_extension
+    parquet_extension
+    simpatico)
 
   add_dependencies(${_target} duckdb_static)
 endforeach()
@@ -537,7 +614,7 @@ endif()
 # set covers the full dependency chain.
 install(
   TARGETS sirius_extension cucascade_static cucascade_cudf_static
-          cucascade_topology_discovery_static telemetry_bridge
+          cucascade_topology_discovery_static telemetry_bridge simpatico
   EXPORT "${DUCKDB_EXPORT_SET}"
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
@@ -555,19 +632,25 @@ endif()
 
 # cmake-format: off
 set(TEST_SOURCES
+    test/cpp/compression/test_compression.cpp
     test/cpp/config/test_config.cpp
     test/cpp/config/test_context.cpp
     test/cpp/config/test_object_store_config.cpp
+    test/cpp/config/test_topology_config.cpp
     test/cpp/data/test_convertible_data_batch.cpp
+    test/cpp/data/test_data_repository_manager_registry.cpp
     test/cpp/data/test_convertible_gpu_pipeline_task.cpp
     test/cpp/downgrade/test_downgrade_disk.cpp
+    test/cpp/creator/test_task_creator.cpp
     test/cpp/downgrade/test_downgrade_executor.cpp
     test/cpp/downgrade/test_downgrade_lifecycle.cpp
+    test/cpp/exec/test_batch_stream.cpp
     test/cpp/exec/test_bounded_thread_pool.cpp
-    test/cpp/exec/test_exchange_channel.cpp
     test/cpp/exec/test_inspectable_mpsc.cpp
     test/cpp/exec/test_interruptible_mpmc.cpp
+    test/cpp/exec/test_multi_index_priority_queue.cpp
     test/cpp/exec/test_semi_future.cpp
+    test/cpp/exec/test_stream_session.cpp
     test/cpp/expression/test_ast_aggregate.cpp
     test/cpp/expression/test_ast_clone.cpp
     test/cpp/expression/test_ast_substitute.cpp
@@ -583,19 +666,38 @@ set(TEST_SOURCES
     test/cpp/expression_evaluator/test_nonduckdb_frontend_proof.cpp
     test/cpp/helper/test_cudf_utils.cpp
     test/cpp/helper/test_logical_type.cpp
+    test/cpp/helper/test_numeric_narrowing.cpp
     test/cpp/helper/test_transaction_utils.cpp
+    test/cpp/integration/test_compressed_materialization_gate.cpp
+    test/cpp/integration/test_compressed_materialization_partition.cpp
+    test/cpp/integration/test_gpu_execution_aggregate_nulls.cpp
+    test/cpp/integration/test_gpu_execution_allnull_scan.cpp
     test/cpp/integration/test_gpu_execution_array.cpp
     test/cpp/integration/test_gpu_execution_dynamic_filter_native.cpp
+    test/cpp/integration/test_gpu_execution_filter_nulls.cpp
+    test/cpp/integration/test_gpu_execution_join_nulls.cpp
     test/cpp/integration/test_gpu_execution_locality.cpp
     test/cpp/integration/test_gpu_execution_multi_format.cpp
+    test/cpp/integration/test_gpu_execution_null_safe_join.cpp
+    test/cpp/integration/test_gpu_execution_order_nulls.cpp
+    test/cpp/integration/test_gpu_execution_parquet_nulls.cpp
+    test/cpp/integration/test_gpu_execution_semantic_cast_fallback.cpp
+    test/cpp/integration/test_parquet_null_predicate_pushdown.cpp
+    test/cpp/integration/test_query_lifecycle_slot.cpp
+    test/cpp/integration/test_gpu_execution_tpcds_nulls.cpp
     test/cpp/integration/test_gpu_execution_tpch.cpp
     test/cpp/integration/test_gpu_execution_tpch_mgpu_audit.cpp
     test/cpp/integration/test_pin_table_host_streaming.cpp
     test/cpp/integration/test_pin_table_merge_columns.cpp
     test/cpp/integration/test_pin_table_column_order.cpp
+    test/cpp/integration/test_pin_table_mvcc_delete.cpp
     test/cpp/integration/test_pin_table_mvcc_foundation.cpp
+    test/cpp/integration/test_pin_table_mvcc_insert.cpp
+    test/cpp/integration/test_pin_table_mvcc_update.cpp
+    test/cpp/integration/test_pin_table_type_drift.cpp
     test/cpp/integration/test_pin_table_zone_map_pruning.cpp
     test/cpp/integration/test_table_gpu_cache_warm_mgpu.cpp
+    test/cpp/integration/test_transparent_runtime_fallback.cpp
     test/cpp/io/s3/test_sigv4.cpp
     test/cpp/io/s3/test_s3_default_visibility_guard.cpp
     test/cpp/io/s3/test_sirius_sigv4_authorizer.cpp
@@ -604,10 +706,14 @@ set(TEST_SOURCES
     test/cpp/io/test_uri_parser.cpp
     test/cpp/io/uring/test_uring_readv.cpp
     test/cpp/io/rest/test_rest_reactor.cpp
+    test/cpp/log/test_duckdb_sink.cpp
+    test/cpp/log/test_logging.cpp
     test/cpp/scan_manager/test_s3_routing_cutover.cpp
     test/cpp/scan_manager/test_pin_table_multi_gpu.cpp
-    test/cpp/scan_manager/test_pin_table_duckdb_native_cache.cpp
     test/cpp/scan_manager/test_cached_serving_hardening.cpp
+    test/cpp/scan_manager/test_insert_delta_job.cpp
+    test/cpp/scan_manager/test_memory_prefetcher_accounting.cpp
+    test/cpp/scan_manager/test_mvcc_mask_job.cpp
     test/cpp/scan_manager/test_pinned_chunk_stats.cpp
     test/cpp/operator/test_physical_grouped_aggregate_merge_mgpu.cpp
     test/cpp/operator/test_physical_hash_join_mgpu.cpp
@@ -616,10 +722,13 @@ set(TEST_SOURCES
     test/cpp/operator/test_partition_memspace_mgpu.cpp
     test/cpp/memory/test_multiple_blocks_allocation_accessor.cpp
     test/cpp/memory/test_topology_index.cpp
+    test/cpp/operator/test_build_probe_scheduling.cpp
+    test/cpp/operator/test_cross_schedule.cpp
     test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_count_distinct.cpp
     test/cpp/operator/aggregate/test_physical_grouped_aggregate_merge.cpp
+    test/cpp/operator/test_crc32_partition_hash.cpp
     test/cpp/operator/test_gpu_partition_impl.cpp
     test/cpp/operator/test_host_table_chunk_reader.cpp
     test/cpp/operator/test_physical_concat.cpp
@@ -632,20 +741,28 @@ set(TEST_SOURCES
     test/cpp/operator/test_physical_partition.cpp
     test/cpp/operator/test_physical_projection.cpp
     test/cpp/operator/test_physical_result_collector.cpp
+    test/cpp/operator/test_physical_streaming_sink.cpp
     test/cpp/operator/test_physical_streaming_source.cpp
     test/cpp/operator/test_physical_table_scan.cpp
     test/cpp/operator/test_no_history_peak_memory_estimate.cpp
     test/cpp/operator/test_physical_top_n.cpp
     test/cpp/operator/test_physical_ungrouped_aggregate.cpp
     test/cpp/operator/test_sirius_dynamic_filter.cpp
+    test/cpp/operator/test_dynamic_filter_publisher.cpp
     test/cpp/operator/test_sirius_dynamic_filter_mgpu.cpp
     test/cpp/parallel/test_task_executor.cpp
+    test/cpp/planner/test_compressed_schema_propagation.cpp
+    test/cpp/planner/test_gpu_admission.cpp
     test/cpp/planner/test_distinct_hash_join_detection.cpp
+    test/cpp/planner/test_duckdb_join_filter_candidate_adapter.cpp
     test/cpp/planner/test_dynamic_filter_router.cpp
     test/cpp/planner/test_join_expression_key.cpp
     test/cpp/planner/test_plan_tree_shape.cpp
     test/cpp/planner/test_projection_fold.cpp
     test/cpp/planner/test_sirius_read_parquet_scan.cpp
+    test/cpp/planner/test_query_id.cpp
+    test/cpp/planner/test_query_index.cpp
+    test/cpp/planner/test_tier_narrowing_policy.cpp
     test/cpp/pipeline/test_batch_lock_utils.cpp
     test/cpp/pipeline/test_gpu_pipeline_executor.cpp
     test/cpp/pipeline/test_oom_reschedule.cpp
@@ -653,27 +770,37 @@ set(TEST_SOURCES
     test/cpp/pipeline/test_gpu_pipeline_task_history.cpp
     test/cpp/pipeline/test_gpu_pipeline_disk_readback.cpp
     test/cpp/pipeline/test_get_next_ports_after_sink.cpp
+    test/cpp/pipeline/test_merge_pipeline_fusion.cpp
     test/cpp/pipeline/test_partition_build_pipelines.cpp
+    test/cpp/pipeline/test_pipeline_build_context.cpp
     test/cpp/pipeline/test_pipeline_dynamic_filter_native_shape.cpp
     test/cpp/pipeline/test_pipeline_schedule_canonical.cpp
     test/cpp/pipeline/test_plan_printer.cpp
     test/cpp/pipeline/test_repository_wiring_materializer.cpp
+    test/cpp/pipeline/test_streaming_sink_root.cpp
     test/cpp/pipeline/test_task_scheduler.cpp
     test/cpp/scan/bench_decode_codecs.cpp
     test/cpp/scan/test_can_serve_with_columns.cpp
     test/cpp/scan/test_duckdb_block_layout.cpp
+    test/cpp/scan/test_duckdb_insert_delta.cpp
+    test/cpp/scan/test_duckdb_mvcc_visibility.cpp
     test/cpp/scan/test_duckdb_native_batch_coalescer.cpp
     test/cpp/scan/test_duckdb_native_dynamic_filter_remap.cpp
+    test/cpp/scan/test_duckdb_native_host_backed_decode.cpp
     test/cpp/scan/test_duckdb_native_walker.cpp
     test/cpp/scan/test_dynamic_filter_merge.cpp
     test/cpp/scan/test_gpu_decode_alp.cpp
     test/cpp/scan/test_gpu_decode_bitpacking.cpp
     test/cpp/scan/test_gpu_decode_rle.cpp
     test/cpp/scan/test_gpu_decode_strings.cpp
+    test/cpp/scan/test_host_keep_mask.cpp
     test/cpp/scan/test_gpu_native_decode.cpp
     test/cpp/scan/test_owning_table_view.cpp
     test/cpp/scan/test_parquet_schema_mapping.cpp
+    test/cpp/scan/test_parquet_null_count_pruning.cpp
     test/cpp/scan/test_parquet_scan_sizing.cpp
+    test/cpp/scan/test_scan_schema_normalization.cpp
+    test/cpp/scan/test_stream_lineage_item5.cpp
     test/cpp/sirius_extension/test_sirius_read_parquet_cardinality.cpp
     test/cpp/sql/test_sirius_sql_rewrite.cpp
     test/cpp/telemetry/test_telemetry_context.cpp
@@ -681,6 +808,7 @@ set(TEST_SOURCES
     test/cpp/unittest.cpp
     test/cpp/utils/pipeline_conversion_test_utils.cpp
     test/cpp/utils/sirius_test_env.cpp
+    test/cpp/utils/test_gpu_execution_comparator.cpp
     test/cpp/utils/utils.cpp)
 # cmake-format: on
 
@@ -698,7 +826,8 @@ if(SIRIUS_BUILD_S3_TESTS)
     test/cpp/io/s3/test_sirius_httpfs.cpp
     test/cpp/io/rest/test_rest_ioctx_integration.cpp
     test/cpp/scan_manager/test_describe_parquet_s3.cpp
-    test/cpp/integration/test_s3_sql_surface.cpp)
+    test/cpp/integration/test_s3_sql_surface.cpp
+    test/cpp/integration/test_s3_tpch.cpp)
 endif()
 
 # Orphaned test files (present in the tree but missing from TEST_SOURCES) are
@@ -707,24 +836,6 @@ endif()
 # test/cpp/orphan_test_allowlist.txt.
 
 add_executable(sirius_unittest ${TEST_SOURCES})
-
-# TPC-DS integration test fixture, generated at build time (opt-in target). The
-# database is not committed; run `cmake --build . --target tpcds-fixture` once
-# before the TPC-DS integration tests. Requires the duckdb CLI (or python3 with
-# the duckdb module) on PATH; both are provided by the pixi environment.
-set(TPCDS_FIXTURE_DIR ${CMAKE_BINARY_DIR}/test-fixtures)
-set(TPCDS_FIXTURE ${TPCDS_FIXTURE_DIR}/tpcds.duckdb)
-set(TPCDS_FIXTURE_SCRIPT
-    ${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/integration/data/duckdb/generate_tpcds_duckdb.sh
-)
-add_custom_command(
-  OUTPUT ${TPCDS_FIXTURE}
-  COMMAND ${CMAKE_COMMAND} -E make_directory ${TPCDS_FIXTURE_DIR}
-  COMMAND bash ${TPCDS_FIXTURE_SCRIPT} ${TPCDS_FIXTURE}
-  DEPENDS ${TPCDS_FIXTURE_SCRIPT}
-  COMMENT "Generating TPC-DS test fixture (SF 0.01) at ${TPCDS_FIXTURE}"
-  VERBATIM)
-add_custom_target(tpcds-fixture DEPENDS ${TPCDS_FIXTURE})
 
 if(VCPKG_BUILD)
   set_target_properties(sirius_unittest PROPERTIES NO_SYSTEM_FROM_IMPORTED ON)
@@ -737,10 +848,11 @@ target_include_directories(
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/duckdb/third_party/catch>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/test/cpp>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>
     $<$<BOOL:${SIRIUS_LEGACY_INCLUDE_DIR}>:$<BUILD_INTERFACE:${SIRIUS_LEGACY_INCLUDE_DIR}>>
 )
 
-target_link_libraries(sirius_unittest sirius_extension duckdb_static)
+target_link_libraries(sirius_unittest sirius_extension duckdb_static ZLIB::ZLIB)
 link_extension_libraries(sirius_unittest "")
 
 # S3 container harness: the testcontainers-native bridge plus libcurl for

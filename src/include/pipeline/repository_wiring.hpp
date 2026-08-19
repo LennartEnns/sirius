@@ -62,19 +62,34 @@ struct repository_wiring {
 //!      (the first operator of `dest_pipeline`, or its sink if there are no operators).
 //!   3. Records the destination on the source operator via `add_next_port_after_sink`.
 //!
-//! Special cases preserved from the previous in-engine implementation:
-//!   - When the destination's type is `RIGHT_DELIM_JOIN`, an additional `FULL`-barrier
-//!     port is also added to its `partition_join` sibling so the partitioned join branch
-//!     can read the same repository.
-//!   - When the destination's type is `LEFT_DELIM_JOIN`, this throws — a left delim join
-//!     should never act as a destination of the directed edge/source operator of the destination
-//!     pipeline.
-//!
 //! Precondition: every `source_pipeline` and `dest_pipeline` referenced in `wirings` must
 //! already have its pipeline id assigned (see `sirius_pipeline::set_pipeline_id`). Port
 //! insertion uses pipeline ids to keep `_ports_list` ordered.
 void materialize_repository_wiring(const std::vector<repository_wiring>& wirings,
                                    cucascade::shared_data_repository_manager& data_repo_manager);
+
+/**
+ * @brief Stamp every operator in @p pipelines with a dense, 0-based id for this query.
+ *
+ * Operators are constructed with `sirius_physical_operator::invalid_operator_id` so that plan
+ * construction carries no cross-query state and two queries can be planned concurrently. This
+ * pass runs once, after the pipeline converter has produced the final pipeline set and before
+ * anything reads an operator id — `materialize_repository_wiring` above is the first consumer,
+ * since it keys each repository on the destination operator's id.
+ *
+ * Ids are assigned in pipeline-scheduling order and, within a pipeline, in
+ * source -> operators -> sink order. Each operator is numbered on first visit, so an operator
+ * appearing in several pipelines keeps one stable id. The resulting ids are `0..N-1`, no gaps.
+ *
+ * The pipeline set — not the plan tree — is the traversal root on purpose:
+ * `sirius_physical_delim_join` owns its `join` and `distinct_root` subtrees outside `children`
+ * and does not override `get_children()`, so a tree walk would miss them. Every operator that
+ * executes belongs to a pipeline.
+ *
+ * @param pipelines The query's pipelines, in scheduling order.
+ * @return The number of operators numbered (i.e. one past the highest id assigned).
+ */
+size_t assign_operator_ids(const duckdb::vector<duckdb::shared_ptr<sirius_pipeline>>& pipelines);
 
 }  // namespace pipeline
 }  // namespace sirius

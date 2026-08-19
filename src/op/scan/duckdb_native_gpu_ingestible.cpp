@@ -56,19 +56,6 @@ namespace sirius::op::scan {
 
 namespace {
 
-/// SIRIUS_METADATA_PARSE_CHUNK: row groups per metadata parse range (the parallel-walk unit).
-std::size_t metadata_parse_chunk()
-{
-  constexpr std::size_t kDefaultParseChunk = 8;
-  if (const char* env = std::getenv("SIRIUS_METADATA_PARSE_CHUNK")) {
-    try {
-      if (const auto v = std::stoull(env); v > 0) return static_cast<std::size_t>(v);
-    } catch (...) { /* fall through to default */
-    }
-  }
-  return kDefaultParseChunk;
-}
-
 //===----------Batch Coalescer----------===//
 class duckdb_native_batch_coalescer : public batch_coalescer {
  public:
@@ -318,12 +305,12 @@ filtered_table duckdb_native_gpu_ingestible::materialize_metadata_to_table(
   rmm::cuda_stream_view stream)
 {
   auto const& split = static_cast<duckdb_native_scan_info const&>(info);
-  if (!split.datasource) {
+  if (!split.datasource && !split.host_backed_only) {
     throw std::runtime_error("[duckdb_native_gpu_ingestible] scan_info has no datasource");
   }
   auto& mem_space_mut = const_cast<::cucascade::memory::memory_space&>(mem_space);
-  auto table =
-    decode_duckdb_native_split(split.row_groups, *_info, *split.datasource, mem_space_mut, stream);
+  auto table          = decode_duckdb_native_split(
+    split.row_groups, *_info, split.datasource.get(), mem_space_mut, stream);
   SIRIUS_LOG_DEBUG(
     "[duckdb_native_gpu_ingestible::materialize_table] decoded split: row_groups={} rows={} "
     "cols={}",
@@ -379,6 +366,8 @@ std::unique_ptr<cudf::table> duckdb_native_gpu_ingestible::post_filter_and_proje
       // Nothing to project away, or output_arity == 0 (count(*)) — keep all columns.
       final_table = owning_table_view{exec.select(input.table.view())};
     }
+    // The select only enqueued its reads; record before input.table's read-lock owner is dropped.
+    input.table.record_reader_event(stream);
   } else {
     final_table = std::move(input.table);
   }

@@ -30,12 +30,14 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 | `LOGICAL_DELIM_GET` | `DELIM_SCAN` | `src/planner/sirius_plan_delim_get.cpp` |
 | `LOGICAL_EXPRESSION_GET` | `COLUMN_DATA_SCAN` | `src/planner/sirius_plan_expression_get.cpp` |
 | `LOGICAL_MATERIALIZED_CTE` | `CTE` | `src/planner/sirius_plan_cte.cpp` |
-| `LOGICAL_CTE_REF` | `CTE_SCAN` | `src/planner/sirius_plan_recursive_cte.cpp` |
+| `LOGICAL_CTE_REF` | `CTE_SCAN` | `src/planner/sirius_plan_recursive_cte.cpp` (materialized CTE refs only — recursive CTEs are unsupported) |
 | `LOGICAL_DUMMY_SCAN` | `DUMMY_SCAN` | `src/planner/sirius_plan_dummy_scan.cpp` |
 | `LOGICAL_EMPTY_RESULT` | `EMPTY_RESULT` | `src/planner/sirius_plan_empty_result.cpp` |
 
 **Unsupported operators** (throw `NotImplementedException`, triggering CPU fallback):
 `LOGICAL_WINDOW`, `LOGICAL_UNNEST`, `LOGICAL_SAMPLE`, `LOGICAL_ANY_JOIN`, `LOGICAL_ASOF_JOIN`, `LOGICAL_CROSS_PRODUCT`, `LOGICAL_RECURSIVE_CTE`
+
+**Unsupported expressions** are rejected the same way, during plan construction rather than at execution time. Wherever a plan builder translates a DuckDB expression via `sirius::ast::from_duckdb()`, a `nullptr` result (untranslatable expression) throws `NotImplementedException` so the query falls back to CPU instead of reaching the GPU evaluator with a hole in its expression list. Rejection sites: projections (`sirius_plan_projection.cpp`), filter predicates (`sirius_plan_filter.cpp`), pushed-down scan filters (`sirius_plan_get.cpp`, `src/op/scan/parquet_gpu_ingestible.cpp`, `sirius_physical_table_scan.cpp` — where a *skipped* pushdown translation is distinguished from a *failed* one so a predicate is never silently dropped), and join conditions (`src/expression/join_condition.cpp`). Nested-typed (STRUCT/LIST/MAP) columns are accepted for scan and projection passthrough but rejected as *operands* — in WHERE, GROUP BY, JOIN ON, and sort keys (`sirius_plan_order.cpp`, `sirius_plan_top_n.cpp`) — via `reject_nested_column_operation()` in `sirius_physical_plan_generator.cpp`. Two further non-operator reject conditions: any plan node whose output types contain `SQLNULL` (e.g. an uncast `NULL` in `VALUES`), and any aggregate expression the translator declines (e.g. ORDER BY aggregates lowered to `arg_min_null`/`create_sort_key`) — both throw in `sirius_physical_plan_generator.cpp` / `sirius_plan_aggregate.cpp`. Because rejection is a plan-capability decision, an unsupported expression falls back even when the input is empty.
 
 ### Join Planning
 
@@ -43,10 +45,12 @@ The `sirius_physical_plan_generator::create_plan()` method is the entry point. I
 
 The `plan_comparison_join()` method selects the join implementation:
 
-1. **Hash Join** — chosen when at least one equality condition exists. Checks `are_conditions_supported()` for mixed joins (equality + inequality on disjoint columns). Created with `max_build_hash_table_bytes` limit.
+1. **Hash Join** — chosen when at least one equality condition exists. Checks `are_conditions_supported()` for mixed joins (equality plus an inequality, or a null-safe `IS NOT DISTINCT FROM` key mixed with a plain `=`, on disjoint columns). Created with `max_build_hash_table_bytes` limit.
 2. **Nested Loop Join** — fallback for pure inequality joins where `PhysicalNestedLoopJoin::IsSupported()` returns true.
 
 Left side = probe (streamed), right side = build (materialized).
+
+Before either is chosen, `materialize_expression_join_keys()` pushes a projection below the join that turns complex equality-key expressions into real columns, rewriting the condition side to a plain reference so `PARTITION` (which hashes by column index) can consume it. It also materializes the *cast* on a null-safe key that will be routed to the mixed join's cuDF AST predicate: a routed key skips the hash-key path's `cudf::cast`, and a cuDF AST can only cast to INT64 / UINT64 / FLOAT64, so e.g. the INTEGER cast DuckDB inserts for a SMALLINT/INTEGER `IS NOT DISTINCT FROM` has to become a column. `are_conditions_supported()` rejects any routed null-safe key still carrying an untranslatable expression, so the join lands on the nested loop join (or CPU) instead of throwing mid-query.
 
 ### Aggregate Planning
 
@@ -57,6 +61,7 @@ Left side = probe (streamed), right side = build (materialized).
 - **AVG decomposition** — AVG is split into SUM + COUNT_VALID (cuDF doesn't support AVG directly)
 - **COUNT(DISTINCT)** — implemented via `COLLECT_SET` aggregation, then counting unique rows
 - **HUGEINT downcast** — HUGEINT types are downcast to BIGINT (cuDF doesn't support int128)
+- **Unsupported aggregate expressions** — `translate_expressions()` rejects any aggregate expression `from_duckdb` cannot translate (see *Unsupported expressions* above), and `can_use_partitioned_aggregate()` declines on a failed translation
 
 ### Filter Pushdown
 
@@ -77,7 +82,7 @@ Projections are omitted when columns are already in the correct order (passthrou
 
 After the operator tree is built, `create_plan()` runs `fold_adjacent_projections()` over the whole plan as a final pass. Sirius routes every planner-created projection through `push_projection()`, which both elides identity passthrough projections and, when its child is already a projection, composes the two select lists into one. The standalone `fold_adjacent_projections()` post-pass then collapses any remaining `PROJECTION → PROJECTION` stacks anywhere in the tree — including projection pairs that arise from separate plan-builder steps (filter `projection_map` reordering, aggregate child/filter hoisting, table-scan unsupported-filter projections, and the user's `SELECT` list) and projections sitting under other operators such as joins.
 
-Composition substitutes each outer select-list reference (`#i`) with a clone of the inner projection's `select_list[i]`. Folding is refused when either select list has a null slot (an unsupported-expression fallback) or when a non-trivial inner expression would be duplicated across multiple outer reference sites; only immediate parent/child projection pairs are candidates, never folds across non-projection operators. The result is a single GPU expression-evaluation stage where multiple stacked projections would otherwise each run `expression_evaluator` over every batch.
+Composition substitutes each outer select-list reference (`#i`) with a clone of the inner projection's `select_list[i]`. Folding is refused when either select list has a null slot (a defensive backstop — plan construction rejects untranslatable expressions up front, so a null slot should not occur) or when a non-trivial inner expression would be duplicated across multiple outer reference sites; only immediate parent/child projection pairs are candidates, never folds across non-projection operators. The result is a single GPU expression-evaluation stage where multiple stacked projections would otherwise each run `expression_evaluator` over every batch.
 
 ## Part 2: Pipeline Structure
 
@@ -203,7 +208,7 @@ In the diagrams below, `[A, B, C]` denotes a pipeline where A is `operators[0]` 
 
 ### TABLE_SCAN Rewrite
 
-During plan generation, a `TABLE_SCAN` whose source is a supported format is rewritten in place into a single `GPU_SCAN` operator (`sirius_gpu_scan_operator`) that inherits the TABLE_SCAN's tree position and stays the source-leaf of the same pipeline — no separate scan pipeline is created. `GPU_SCAN` is format-agnostic: it owns a pluggable `io::gpu_ingestible` that knows how to enumerate splits and materialize each split into a `cudf::table`. `wrap_table_scan_source()` (`src/planner/sirius_physical_plan_generator.cpp`) dispatches on the bound table function name:
+During plan generation, a `TABLE_SCAN` whose source is a supported format is rewritten in place into a single `GPU_SCAN` operator (`sirius_gpu_scan_operator`) that inherits the TABLE_SCAN's tree position and stays the source-leaf of the same pipeline — no separate scan pipeline is created. `GPU_SCAN` is format-agnostic: it owns a pluggable `gpu_ingestible` that knows how to enumerate splits and materialize each split into a `cudf::table`. `wrap_table_scan_source()` (`src/planner/sirius_physical_plan_generator.cpp`) dispatches on the bound table function name:
 
 **Parquet (`parquet_scan` / `read_parquet` / `sirius_read_parquet`, including `s3://` paths):** `build_parquet_table_info()` captures the DuckDB bind data (resolved file paths, hive-partition indices, returned/column/projection ids, table filters) into a `parquet_ingestible_table_info`, builds a parquet ingestible via `make_ingestible()`, and constructs the `GPU_SCAN` operator around it.
 
@@ -211,7 +216,7 @@ During plan generation, a `TABLE_SCAN` whose source is a supported format is rew
 
 Any other scan function falls back to CPU: `create_plan(LogicalGet&)` declines it before plan generation reaches the wrap.
 
-During `prepare_for_query`, `sirius_scan_manager` takes the ingestible off each `GPU_SCAN` operator, peeks its file paths for a pinned-cache match (substituting a cached ingestible on a hit), and binds a `split_connector` to the operator. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
+During `prepare_for_query`, `sirius_scan_manager` inspects each `GPU_SCAN` operator's ingestible for a pinned-cache match. A cache miss uses `split_provider`; a cache hit uses `cached_databatch_provider`. The operator keeps its ingestible in both cases. Providers push splits into the connector the operator created at plan time. The operator pulls splits from the connector inside `get_next_task_input_data()` (see [Scan — Scan Manager](scan.md#scan-manager)).
 
 ### HASH_JOIN Probe Side
 
@@ -272,8 +277,11 @@ graph LR
 For a dynamic-filter-producing `BUILD_PROBE` join, the build CONCAT switches to `concat_all` and
 its synchronous `"build"`-port push completes filter construction, multi-GPU replication, and
 channel publication before downstream task creation follows that join into its **immediate** probe
-producer. This edge ordering does not gate a base scan reached transitively through an intervening
-join; such a scan samples the channel opportunistically under normal scheduler order. See
+producer. In a **broadcast** join there are `num_gpus` build CONCATs (one per replicated slot), each
+doing a `concat_all` push of the full build; the first to arrive publishes (exactly-once via the
+`OPEN -> PUBLISHING` compare-exchange). This edge ordering does not gate a base scan reached
+transitively through an intervening join; such a scan samples the channel opportunistically under
+normal scheduler order. See
 [Immediate-probe ordering](dynamic-filters.md#immediate-probe-ordering) and
 [Transitive scan targets and publication timing](dynamic-filters.md#transitive-scan-targets-and-publication-timing).
 
@@ -303,6 +311,8 @@ graph LR
 2. **Pipeline 2**: PARTITION. Repository to MERGE_GROUP_BY uses `FULL` barrier (downstream is not CONCAT — `PARTIAL` is only used when PARTITION feeds directly into CONCAT)
 3. **Pipeline 3**: MERGE_GROUP_BY. Downstream pipelines updated to use MERGE_GROUP_BY as source
 
+> With `fuse_merge_pipelines` (default on), Pipeline 3 is usually not a standalone pipeline: MERGE_GROUP_BY folds into the downstream sink's pipeline as an intermediate. See [Merge fusion](#merge-fusion) below.
+
 ### UNGROUPED_AGGREGATE
 
 ```mermaid
@@ -323,19 +333,38 @@ graph LR
 
 MERGE_TOP_N merges local top-N results.
 
+> With `fuse_merge_pipelines` (default on), Pipeline 2 usually folds MERGE_TOP_N into the downstream sink's pipeline rather than forming its own. See [Merge fusion](#merge-fusion) below.
+
+### Merge fusion
+
+By default (`fuse_merge_pipelines = true`) an eligible `MERGE_GROUP_BY` or `MERGE_TOP_N` does **not** open its own terminal pipeline. Instead it joins its downstream sink's pipeline as an intermediate operator, removing one task launch and one repository round-trip (typically `merge → RESULT_COLLECTOR` at the query tail):
+
+```mermaid
+graph LR
+    P1["Pipeline 1<br/>[scan, ..., HASH_GROUP_BY]"] -->|"FULL"| P2["Pipeline 2<br/>[PARTITION]"]
+    P2 -->|"FULL"| P3["Pipeline 3<br/>[MERGE_GROUP_BY -> sink]"]
+```
+
+Eligibility is decided at plan time by `mark_fusable_merge_pipelines` (`sirius_physical_plan_generator.cpp`), which walks parent pointers from each merge to the first downstream sink. Fusion applies when that path is unary and streaming and the sink accepts a fused input; the merge's own `build_pipelines` override then adds itself to the current pipeline and recurses into its child (which still cuts the upstream boundary). The following are **excluded** and keep the standalone merge boundary:
+
+- **Join / CTE / delim terminals** (`HASH_JOIN`, `NESTED_LOOP_JOIN`, `CTE`, `LEFT/RIGHT_DELIM_JOIN`) — multiple inputs or bespoke sink wiring.
+- **Partition sinks** (`PARTITION`, `SORT_PARTITION`) — require complete upstream input in one task.
+- **Delim-owned merges** — the distinct-root merge inside a delim join needs its dedicated sink wiring.
+- **`MERGE_AGGREGATE`** (ungrouped aggregate) — uses a different partial-result handoff.
+
+Total-input structural sinks such as `ORDER_BY`, `TOP_N`, and an outer `GROUP BY` **are** fusable: they already buffer their full input, so folding the merge in does not change when they observe complete data.
+
 ### DELIM_JOIN
 
-Complex splitting for correlated subqueries. Both LEFT and RIGHT variants contain two internal operators:
-- `join` — the actual HASH_JOIN (one child replaced with a scan of cached data)
-- `distinct` — a HASH_GROUP_BY that produces deduplicated data for DELIM_SCAN operators in the correlated subquery
+Decorrelated correlated-subquery join. Both variants hold two internal operators:
+- `join` — the HASH_JOIN doing the join-back (one child replaced by a cached-data scan)
+- `distinct_root` — the `MERGE_GROUP_BY → PARTITION_DISTINCT → DISTINCT` chain that dedups the correlated key for the subquery's DELIM_SCANs (`distinct` is a non-owning borrow of the bottom DISTINCT)
 
-When the delim join's `sink()` is called, it pushes data to both internal operators simultaneously. The distinct output is then partitioned and merged externally. Additionally, the internal HASH_JOIN undergoes standard probe-side and build-side splitting (documented in the [HASH_JOIN](#hash_join-probe-side) sections above).
+The delim join is a **fan-out sink that performs no data transformation**: `execute()` is a pass-through, and its base `sink()` forwards each input batch unchanged to two branch pipelines — the DISTINCT branch and the join-feeding branch (`partition_join` for RIGHT, `column_data_scan` for LEFT). It owns the fan-out (two `next_port_after_sink` edges) and anchors the construct (the `distinct` / `join` / `column_data_scan` / `delim_scans` pointers and the DELIM_SCAN dependency); the dedup and the join happen in the sub-operators.
 
 #### RIGHT_DELIM_JOIN
 
-In the constructor, RIGHT_DELIM_JOIN extracts the RHS child from the internal join and replaces it with a `dummy_scan`. The extracted RHS becomes `children[0]` of the delim join, built via a child meta-pipeline. A `partition_join` (PARTITION, is_build=true) is created during `initialize_internal()` to partition data for the actual join's build side.
-
-When `operators.size() > 0` (intermediate operators before the delim join), a pipeline breaker is inserted:
+Ctor: extract the RHS from the internal join, replace it with a `dummy_scan` placeholder; the RHS becomes `children[0]`. `wrap_join` wraps the build side as `CONCAT_build → PARTITION_build → DUMMY_SCAN`, and `partition_join` points at that PARTITION_build. With intermediate operators before the delim join (`operators.size() > 0`), a pipeline breaker is inserted:
 
 ```mermaid
 graph LR
@@ -347,17 +376,14 @@ graph LR
     MR -->|"FULL"| DS["Downstream<br/>(DELIM_SCAN pipelines)"]
 ```
 
-Dashed edges indicate internal pushes from `RIGHT_DELIM_JOIN.sink()` to `partition_join` and `distinct`.
+With no intermediate operators, no breaker is needed — RIGHT_DELIM_JOIN is the current pipeline's sink directly.
 
-When `operators.size() == 0` (no intermediate operators), no pipeline breaker is needed — the current pipeline keeps RIGHT_DELIM_JOIN as its sink directly.
-
-- The CONCAT is a build concat (`is_build=true`); it connects to the internal HASH_JOIN's `"build"` port in the probe pipeline
-- The probe and build `partition_join` operators are linked as siblings for partition count coordination
-- `partition_join` also receives a `FULL` barrier port on the same repository as the delim join (line 88–94 in `insert_repository`)
+- `partition_join` (PARTITION_build) is a single-op pipeline fed by the fan-out; its build CONCAT feeds the HASH_JOIN `"build"` port.
+- Probe and build partitions are linked as siblings; the inner join is identified via its tree parent (`link_join_partition_siblings`) so the build (distinct) side drives the partition count.
 
 #### LEFT_DELIM_JOIN
 
-In the constructor, LEFT_DELIM_JOIN extracts the LHS child from the internal join and replaces it with a `column_data_scan`. The extracted LHS becomes `children[0]`, built via a child meta-pipeline. Unlike RIGHT_DELIM_JOIN, **no pipeline breaker** is created and **no partition_join/concat pair** is needed — the `column_data_scan` directly feeds downstream pipelines.
+Ctor: extract the LHS from the internal join, replace it with a `column_data_scan`; the LHS becomes `children[0]`. No breaker and no partition_join/concat pair.
 
 ```mermaid
 graph LR
@@ -367,11 +393,8 @@ graph LR
     MR -->|"FULL"| DS["Downstream<br/>(DELIM_SCAN pipelines)"]
 ```
 
-Dashed edges indicate internal pushes from `LEFT_DELIM_JOIN.sink()` to `column_data_scan` and `distinct`.
-
-- `column_data_scan` caches the input data so the internal HASH_JOIN's probe side can scan it
-- The internal HASH_JOIN is built into the probe pipeline via `join->build_pipelines()`, so its build side (the correlated subquery) gets a normal child meta-pipeline with standard HASH_JOIN handling
-- `build_join_pipelines` adds the internal HASH_JOIN as an operator in the probe pipeline, with `column_data_scan` as its source: `[column_data_scan, HASH_JOIN, ..., outer_sink]`
+- `column_data_scan` is the source of the join's probe pipeline (`[column_data_scan, HASH_JOIN, ..., outer_sink]`), fed by the fan-out.
+- The internal HASH_JOIN's build side (the subquery) gets standard build splitting via `join->build_pipelines()`.
 
 #### Key Differences
 
@@ -381,7 +404,7 @@ Dashed edges indicate internal pushes from `LEFT_DELIM_JOIN.sink()` to `column_d
 | Internal join child replaced | RHS → `dummy_scan` | LHS → `column_data_scan` |
 | Pipeline breaker | Yes (if intermediate ops exist) | Never |
 | Build-side data path | `partition_join` → CONCAT → HASH_JOIN "build" port | Standard HASH_JOIN build handling (correlated subquery) |
-| Inner-join build subtree | Synthetic scaffolding (CONCAT_build → PARTITION_build → DUMMY_SCAN); `partition_join` runs inline in `sink()` | Real correlated-subquery subtree under CONCAT_build |
+| Inner-join build subtree | CONCAT_build → PARTITION_build (`partition_join`) → DUMMY_SCAN placeholder; `partition_join` is a framework-scheduled pipeline fed by the fan-out | Real correlated-subquery subtree under CONCAT_build |
 | Cached data scan | N/A | `column_data_scan` feeds probe side |
 
 ## Part 4: Port Wiring

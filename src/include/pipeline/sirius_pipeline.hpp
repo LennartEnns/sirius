@@ -28,6 +28,7 @@
 #include <nvtx3/nvtx3.hpp>
 
 #include <mutex>
+#include <utility>
 #include <vector>
 
 namespace sirius {
@@ -138,6 +139,17 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   [[nodiscard]] std::vector<op::sirius_physical_operator::next_port_info>
   get_next_ports_after_sink() const;
 
+  //! A cross-pipeline port described as its peer operator plus the port's barrier type.
+  using port_barrier_info = std::pair<op::sirius_physical_operator*, op::MemoryBarrierType>;
+
+  //! Returns the (producer operator, barrier) pair for every port feeding data into this
+  //! pipeline. The producer operator is the sink of the upstream (source) pipeline.
+  [[nodiscard]] std::vector<port_barrier_info> get_ingress_ports_info() const;
+
+  //! Returns the (consumer operator, barrier) pair for every port this pipeline feeds data into.
+  //! The consumer operator is the downstream operator that receives the sink's output.
+  [[nodiscard]] std::vector<port_barrier_info> get_egress_ports_info() const;
+
   //! Set the pipeline ID
   void set_pipeline_id(size_t id) { pipeline_id = id; }
   //! Get the pipeline ID
@@ -174,6 +186,10 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
   //! Checks if the pipeline has been finished
   virtual bool is_pipeline_finished() const;
 
+  //! Query-terminal sink (RESULT_COLLECTOR or STREAMING_SINK): no downstream schedule/wiring;
+  //! completion signals execute().
+  [[nodiscard]] bool is_query_terminal() const;
+
   void mark_task_created();
   void mark_task_completed();
 
@@ -183,6 +199,13 @@ class sirius_pipeline : public duckdb::enable_shared_from_this<sirius_pipeline> 
 
   //! Set the task_creator pointer so this pipeline can schedule downstream consumers on finish.
   void set_task_creator(sirius::creator::task_creator* tc);
+
+  //! task_creator for schedule(), or nullptr when unwired. Streaming sources use this to
+  //! re-arm a starved head; schedule() only enqueues, so off-thread calls are safe.
+  [[nodiscard]] sirius::creator::task_creator* get_task_creator() const noexcept
+  {
+    return _task_creator;
+  }
 
   //! Returns a scoped lock on the pipeline status mutex.
   //! Callers must hold this lock across the operation that consumes pipeline state

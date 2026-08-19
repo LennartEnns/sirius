@@ -19,6 +19,7 @@
 // sirius
 #include <op/scan/gpu_ingestible.hpp>
 #include <op/sirius_physical_operator.hpp>
+#include <scan_manager/mvcc_chunk_mask.hpp>
 // cucascade
 #include <cucascade/cudf/gpu_data_representation.hpp>
 #include <cucascade/data/data_batch.hpp>
@@ -43,7 +44,7 @@ namespace sirius::op::scan {
  *
  * Carries the per-split scan descriptor and (optional) post-decode
  * filter/projection description. The materialize step delegates to the
- * operator's installed @c io::gpu_ingestible — the operator does not see
+ * operator's installed @c gpu_ingestible — the operator does not see
  * the source format directly.
  *
  * Source operator data: holds no upstream batches that need locking, so
@@ -110,6 +111,17 @@ class scan_operator_input : public op::operator_data {
     return *std::get<std::unique_ptr<scan_info>>(materialization_info);
   }
 
+  [[nodiscard]] std::string get_origin_tiers() const override
+  {
+    if (!is_resident()) { return "SOURCE"; }
+    // The batch's tier is only readable through a lock accessor; take the non-blocking
+    // one and fall back to UNKNOWN if the batch is exclusively locked right now.
+    if (auto ro = get_cached_batch()->try_to_read_only()) {
+      return tier_display_name(ro->get_current_tier());
+    }
+    return "UNKNOWN";
+  }
+
   [[nodiscard]] std::shared_ptr<::cucascade::data_batch> get_cached_batch() const
   {
     if (!is_resident()) {
@@ -123,6 +135,41 @@ class scan_operator_input : public op::operator_data {
   cucascade::memory::memory_space* gpu_memory_space = nullptr;
   std::variant<std::monostate, std::unique_ptr<scan_info>, std::shared_ptr<::cucascade::data_batch>>
     materialization_info;
+  /// Per-query MVCC keep-mask for a resident cached chunk; a default mask =
+  /// every row visible (no upload, no kernel). Attached by
+  /// drain_cached_provider, applied in gpu_ingestible::materialize_table's
+  /// resident branch. Self-contained: the mask's owning words pointer keeps
+  /// the storage alive for the split's lifetime.
+  scan_manager::mvcc_chunk_mask mvcc_keep_mask;
+  /// True when the op's ingestible will run a row-filter expression against
+  /// this split's materialized table (post_filter_and_project filters by
+  /// copy). Stamped by drain_cached_provider on resident splits; scan_info
+  /// splits fold filter costs into their own estimates instead.
+  bool row_filter_pending{false};
+  /// Per-query table taken out of the cached wrapper batch right after
+  /// prepare_for_processing's conversion produced it (decompressed or
+  /// uploaded fresh for this split) — never raw GPU pin storage, which is
+  /// served as a plain gpu_table_representation and never converted.
+  /// Consumed at most once by materialize_table, which moves it into the
+  /// scan output instead of deep-copying the batch. Mutable: the operator
+  /// only sees its input as const during execute.
+  mutable std::unique_ptr<cudf::table> stolen_table;
+  /// Size of the stolen table, kept past consumption so OOM-retry size
+  /// estimates stay accurate while the wrapper batch holds only an empty
+  /// placeholder.
+  std::size_t stolen_table_bytes{0};
+  /// Set when materialize_table consumes the stolen table. A re-entry after
+  /// consumption (scan-internal OOM retry) must fail loudly rather than
+  /// serve the emptied wrapper batch as zero rows.
+  mutable bool stolen_table_consumed{false};
+  /// True when scan normalization will cast at least one selected column of this resident cached
+  /// split. Stamped by drain_cached_provider from databatch_provider::batch, which owns the
+  /// definition.
+  bool needs_carrier_conversion{false};
+  /// Stamped by drain_cached_provider from databatch_provider::batch::conversion_destination_bytes,
+  /// which owns the definition. Zero means unknown; the scan memory estimate then keeps its
+  /// conservative maximum-expansion bound.
+  std::size_t conversion_destination_bytes{0};
 };
 
 }  // namespace sirius::op::scan

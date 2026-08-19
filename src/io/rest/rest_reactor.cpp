@@ -97,6 +97,15 @@ size_t write_discard(char* /*ptr*/, size_t size, size_t nmemb, void* /*userdata*
   return size * nmemb;
 }
 
+/// Accumulate the whole response body into a std::string (small control-plane
+/// responses only — e.g. one ListObjectsV2 XML page).
+size_t write_string(char* ptr, size_t size, size_t nmemb, void* userdata)
+{
+  auto* out = static_cast<std::string*>(userdata);
+  out->append(ptr, size * nmemb);
+  return size * nmemb;
+}
+
 /// Lowercase a byte.
 char ascii_lower(char c) { return static_cast<char>(std::tolower(static_cast<unsigned char>(c))); }
 
@@ -134,10 +143,39 @@ size_t capture_header(char* buffer, size_t size, size_t nitems, void* userdata)
   return bytes;
 }
 
+/// True iff @p line is an HTTP status line ("HTTP/..."), i.e. the start of a
+/// (possibly interim) response's header block within one transfer.
+bool is_http_status_line(std::string_view line) noexcept
+{
+  return line.size() >= 5 && ascii_lower(line[0]) == 'h' && ascii_lower(line[1]) == 't' &&
+         ascii_lower(line[2]) == 't' && ascii_lower(line[3]) == 'p' && line[4] == '/';
+}
+
+/// Per-attempt capture for the blocking HEAD: Retry-After for backoff plus the
+/// object's ETag.  Separate from @c header_capture so the async data-GET path
+/// parses nothing it does not consume.  The ETag resets on every status line,
+/// so interim responses (proxy CONNECT) within one transfer leave no residue.
+struct head_capture {
+  std::string retry_after;
+  std::string etag;
+};
+
+size_t head_header_cb(char* buffer, size_t size, size_t nitems, void* userdata)
+{
+  auto* hc           = static_cast<head_capture*>(userdata);
+  size_t const bytes = size * nitems;
+  std::string_view const line(buffer, bytes);
+  if (is_http_status_line(line)) { hc->etag.clear(); }
+  if (auto v = match_header(line, "etag"); !v.empty()) { hc->etag = std::move(v); }
+  if (auto v = match_header(line, "retry-after"); !v.empty()) { hc->retry_after = std::move(v); }
+  return bytes;
+}
+
 /// Shared sink for a suffix-range footer probe: the header callback records the
-/// HTTP status (from the status line) plus Content-Range / Retry-After; the body
-/// callback consults @c status to abort a non-206 response before it streams a
-/// whole object into us.  @c HEADERDATA and @c WRITEDATA point at the same one.
+/// HTTP status (from the status line) plus Content-Range / Retry-After / ETag;
+/// the body callback consults @c status to abort a non-206 response before it
+/// streams a whole object into us.  @c HEADERDATA and @c WRITEDATA point at the
+/// same one.
 struct suffix_sink {
   std::vector<std::uint8_t> data;
   std::size_t cap{0};
@@ -145,18 +183,20 @@ struct suffix_sink {
   long status{0};
   std::string content_range;
   std::string retry_after;
+  std::string etag;
 };
 
 /// Header callback for a suffix probe: parse the status code out of the status
 /// line so the body callback can abort a non-206 early, and capture the headers
-/// the caller needs (Content-Range to verify the 206, Retry-After for backoff).
+/// the caller needs (Content-Range to verify the 206, Retry-After for backoff,
+/// ETag for the probe result).
 size_t suffix_header_cb(char* buffer, size_t size, size_t nitems, void* userdata)
 {
   auto* s            = static_cast<suffix_sink*>(userdata);
   size_t const bytes = size * nitems;
   std::string_view const line(buffer, bytes);
-  if (line.size() >= 5 && ascii_lower(line[0]) == 'h' && ascii_lower(line[1]) == 't' &&
-      ascii_lower(line[2]) == 't' && ascii_lower(line[3]) == 'p' && line[4] == '/') {
+  if (is_http_status_line(line)) {
+    s->etag.clear();
     if (auto const sp = line.find(' '); sp != std::string_view::npos) {
       long code = 0;
       for (size_t i = sp + 1; i < line.size() && line[i] >= '0' && line[i] <= '9'; ++i) {
@@ -167,6 +207,7 @@ size_t suffix_header_cb(char* buffer, size_t size, size_t nitems, void* userdata
   }
   if (auto v = match_header(line, "content-range"); !v.empty()) { s->content_range = std::move(v); }
   if (auto v = match_header(line, "retry-after"); !v.empty()) { s->retry_after = std::move(v); }
+  if (auto v = match_header(line, "etag"); !v.empty()) { s->etag = std::move(v); }
   return bytes;
 }
 
@@ -510,7 +551,8 @@ void rest_reactor::enqueue_chunks(std::span<std::unique_ptr<rest_chunked_rx_requ
 
 rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_config_type& cfg,
                                                                   const io_object_type& file,
-                                                                  const io_object_segment& segment)
+                                                                  const io_object_segment& segment,
+                                                                  bool perf_blocking_host_get)
 {
   if (segment.size == 0) { return rest_rx_request::create({}); }
 
@@ -547,12 +589,13 @@ rest_reactor::request_type_ptr rest_reactor::prep_host_rx_request(const reactor_
   chunks.reserve(n_chunks);
   size_t pos = 0;  // byte offset within the segment
   for (size_t c = 0; c < n_chunks; ++c) {
-    size_t const piece = base + (c < rem ? 1 : 0);
-    auto req           = std::make_unique<rest_chunked_rx_request>();
-    req->object        = obj;
-    req->chunk         = io_object_segment{segment.offset + pos, piece, dst + pos};
-    req->file_size     = fsize;
-    req->manager       = manager;
+    size_t const piece          = base + (c < rem ? 1 : 0);
+    auto req                    = std::make_unique<rest_chunked_rx_request>();
+    req->object                 = obj;
+    req->chunk                  = io_object_segment{segment.offset + pos, piece, dst + pos};
+    req->file_size              = fsize;
+    req->manager                = manager;
+    req->perf_blocking_host_get = perf_blocking_host_get;
     chunks.push_back(std::move(req));
     pos += piece;
   }
@@ -776,7 +819,8 @@ size_t rest_reactor::host_read(const io_object_type& file, size_t offset, size_t
   // full TCP+TLS handshake per call and duplicates the retry logic.  Build the
   // request, grab its future BEFORE enqueue (which moves the chunks out), then
   // block: get() rethrows the first reported error or returns the byte count.
-  auto req = prep_host_rx_request(_config, file, io_object_segment{offset, size, dst});
+  auto req = prep_host_rx_request(
+    _config, file, io_object_segment{offset, size, dst}, /*perf_blocking_host_get=*/true);
   auto fut = req->get_future();
   enqueue(std::move(req));
   return std::move(fut).get();
@@ -798,15 +842,20 @@ rest_perf_snapshot rest_reactor::perf_snapshot() const noexcept
   s.terminal_failures_total  = _perf.terminal_failures_total.load(std::memory_order_relaxed);
   s.device_stream_sync_total = _perf.device_stream_sync_total.load(std::memory_order_relaxed);
   s.payload_bytes_read_total = _perf.payload_bytes_read_total.load(std::memory_order_relaxed);
+  s.blocking_host_get_count  = _perf.blocking_host_get_count.load(std::memory_order_relaxed);
+  s.blocking_host_get_wall_ns_total =
+    _perf.blocking_host_get_wall_ns_total.load(std::memory_order_relaxed);
+  s.blocking_host_get_wall_ns_max =
+    _perf.blocking_host_get_wall_ns_max.load(std::memory_order_relaxed);
   return s;
 }
 
-size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view key)
+head_object_result rest_reactor::head_object_size(std::string_view bucket, std::string_view key)
 {
   s3::s3_object_ref const obj{std::string(bucket), std::string(key)};
   std::string last_error;
   for (std::size_t attempt = 0; attempt < _config.max_retry_attempts; ++attempt) {
-    header_capture hc;
+    head_capture hc;
     auto const authd =
       _ctx->authorizer()->authorize(obj, s3::s3_request_method::HEAD, presign_ttl(_config));
 
@@ -820,7 +869,7 @@ size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view 
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_NOBODY, 1L));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HTTPHEADER, hdrs.get()));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEFUNCTION, &write_discard));
-    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERFUNCTION, &capture_header));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERFUNCTION, &head_header_cb));
     SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERDATA, &hc));
 
     CURLcode const rc = curl_easy_perform(h.get());
@@ -835,7 +884,7 @@ size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view 
         throw std::runtime_error("rest_reactor::head_object_size: missing Content-Length for " +
                                  obj.bucket + "/" + obj.key);
       }
-      return static_cast<size_t>(cl);
+      return head_object_result{static_cast<size_t>(cl), std::move(hc.etag)};
     }
 
     last_error =
@@ -861,6 +910,66 @@ size_t rest_reactor::head_object_size(std::string_view bucket, std::string_view 
   _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
   throw std::runtime_error("rest_reactor::head_object_size: exhausted retries (" + last_error +
                            ") for " + obj.bucket + "/" + obj.key);
+}
+
+std::string rest_reactor::list_page(std::string_view bucket,
+                                    std::string_view prefix,
+                                    std::string_view canonical_query)
+{
+  std::string const bucket_s{bucket};
+  std::string const prefix_s{prefix};
+  std::string last_error;
+  for (std::size_t attempt = 0; attempt < _config.max_retry_attempts; ++attempt) {
+    header_capture hc;
+    auto const authd = _ctx->authorizer()->authorize_list(
+      bucket_s, std::string{canonical_query}, presign_ttl(_config));
+
+    curl_easy_ptr h{curl_easy_init()};
+    if (!h) { throw std::runtime_error("rest_reactor::list_page: curl_easy_init failed"); }
+    configure_easy_handle(h.get(), global_curl_context::instance().share_handle());
+    apply_request_opts(h.get(), _config);
+
+    std::string body;
+    curl_slist_ptr hdrs = build_header_list(authd.headers, nullptr);
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_URL, authd.url.c_str()));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HTTPGET, 1L));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HTTPHEADER, hdrs.get()));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEFUNCTION, &write_string));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_WRITEDATA, &body));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERFUNCTION, &capture_header));
+    SIRIUS_CURL_CHECK(curl_easy_setopt(h.get(), CURLOPT_HEADERDATA, &hc));
+
+    CURLcode const rc = curl_easy_perform(h.get());
+    long status       = 0;
+    curl_easy_getinfo(h.get(), CURLINFO_RESPONSE_CODE, &status);
+
+    // Control-plane response: the XML body is deliberately NOT credited to
+    // chunk_get_count / payload_bytes_read_total — those budget object reads.
+    if (rc == CURLE_OK && status == 200) { return body; }
+
+    last_error =
+      rc != CURLE_OK ? std::string(curl_easy_strerror(rc)) : ("HTTP " + std::to_string(status));
+    bool const retriable =
+      (rc != CURLE_OK && is_retriable_curl(rc)) || (rc == CURLE_OK && is_retriable_status(status));
+    if (!retriable) {
+      _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
+      throw std::runtime_error("rest_reactor::list_page: " + last_error + " for " + bucket_s + "/" +
+                               prefix_s);
+    }
+    if (attempt + 1 < _config.max_retry_attempts) {
+      _perf.retries_total.fetch_add(1, std::memory_order_relaxed);
+      SIRIUS_LOG_WARN("rest_reactor::list_page: retrying {}/{} after {} (attempt {}/{})",
+                      bucket_s,
+                      prefix_s,
+                      last_error,
+                      attempt + 1,
+                      _config.max_retry_attempts);
+      std::this_thread::sleep_for(compute_backoff(attempt, hc.retry_after, _config));
+    }
+  }
+  _perf.terminal_failures_total.fetch_add(1, std::memory_order_relaxed);
+  throw std::runtime_error("rest_reactor::list_page: exhausted retries (" + last_error + ") for " +
+                           bucket_s + "/" + prefix_s);
 }
 
 footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
@@ -938,6 +1047,7 @@ footer_probe rest_reactor::fetch_footer_suffix(std::string_view bucket,
         probe.object_size = *total;
         probe.window_lo   = *start;
         probe.bytes       = std::make_shared<const std::vector<std::uint8_t>>(std::move(sink.data));
+        probe.etag        = std::move(sink.etag);
       }
       return probe;
     } else if (status == 200 || status == 416) {
@@ -1467,11 +1577,19 @@ void rest_reactor::worker_loop(const std::stop_token& stop_token)
             static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - req.t_submit)
                                          .count());
+          // Every completed ranged GET bumps chunk_get_*, blocking host_reads
+          // included. A blocking single host_read additionally bumps
+          // blocking_host_get_* — the two are additive, not disjoint.
           _perf.chunk_get_ns_total.fetch_add(get_ns, std::memory_order_relaxed);
           _perf.chunk_get_count.fetch_add(1, std::memory_order_relaxed);
           atomic_max_relaxed(_perf.chunk_get_ns_max, get_ns);
           std::uint64_t expected = 0;
           _perf.ttfb_ns.compare_exchange_strong(expected, get_ns, std::memory_order_relaxed);
+          if (req.perf_blocking_host_get) {
+            _perf.blocking_host_get_count.fetch_add(1, std::memory_order_relaxed);
+            _perf.blocking_host_get_wall_ns_total.fetch_add(get_ns, std::memory_order_relaxed);
+            atomic_max_relaxed(_perf.blocking_host_get_wall_ns_max, get_ns);
+          }
         }
         if (req.is_device()) {
           // Issue the async H2D copy.  Bounce-staged reads need a CUDA event so

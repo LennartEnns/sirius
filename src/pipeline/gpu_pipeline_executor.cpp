@@ -115,11 +115,16 @@ void gpu_pipeline_executor::manager_loop()
     auto ready       = std::make_unique<task_request>();
     ready->kind      = task_request_kind::device_ready;
     ready->device_id = _memory_space->get_device_id();
-    if (!_task_request_publisher.send(std::move(ready))) {
-      SIRIUS_LOG_INFO("GPU Pipeline Executor: task_request channel closed, stopping manager loop");
-      break;
+
+    std::unique_ptr<parallel::itask> pipeline_task = nullptr;
+    {
+      if (!_task_request_publisher.send(std::move(ready))) {
+        SIRIUS_LOG_INFO(
+          "GPU Pipeline Executor: task_request channel closed, stopping manager loop");
+        break;
+      }
+      pipeline_task = _task_queue.pop();  // block till a task is available
     }
-    auto pipeline_task = _task_queue.pop();  // block till a task is available
     if (!pipeline_task) {
       SIRIUS_LOG_INFO("GPU Pipeline Executor: task queue interrupted, stopping manager loop");
       break;
@@ -302,7 +307,8 @@ void gpu_pipeline_executor::manager_loop()
        pipeline]() mutable {
         try {
           task->execute(exc_stream);
-        } catch (oom_reschedule_exception& oom) {
+          _tasks_executed.fetch_add(1, std::memory_order_relaxed);
+        } catch (task_reschedule_exception& ex) {
           if (_completion_handler && _completion_handler->has_error()) {
             // If the completion handler is already in an error state, then we can just return and
             // not try to reschedule
@@ -310,10 +316,10 @@ void gpu_pipeline_executor::manager_loop()
           }
           auto* gpu_task = cast_to_gpu_pipeline_task(task.get());
           if (!gpu_task) {
-            SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast task for OOM reschedule");
+            SIRIUS_LOG_ERROR("GPU Pipeline Executor: Failed to cast task for reschedule");
             if (_completion_handler) {
               _completion_handler->report_error(
-                "GPU Pipeline Executor: Failed to cast task for OOM reschedule");
+                "GPU Pipeline Executor: Failed to cast task for reschedule");
             }
             return;
           }
@@ -339,34 +345,35 @@ void gpu_pipeline_executor::manager_loop()
           // too short. With 100 retries × 50 ms backoff (~5 s) the probe
           // tasks get enough patience to clear the contention window while
           // still bailing out on truly wedged queries.
-          static constexpr uint32_t MAX_OOM_RETRIES = 100;
-          if (next_retry_count > MAX_OOM_RETRIES) {
+          static constexpr uint32_t MAX_RETRIES = 100;
+          if (next_retry_count > MAX_RETRIES) {
             SIRIUS_LOG_ERROR(
-              "GPU Pipeline Executor: task {} (original task {}) exceeded {} OOM retries at "
-              "operator index {} — terminating query",
+              "GPU Pipeline Executor: task {} (original task {}) exceeded {} retries at "
+              "operator index {} — terminating query: {}",
               gpu_task->get_task_id(),
               orig_task_id,
-              MAX_OOM_RETRIES,
-              oom.get_resume_operator_index());
+              MAX_RETRIES,
+              ex.get_resume_operator_index(),
+              ex.what());
             if (_completion_handler) {
-              _completion_handler->report_error(std::make_exception_ptr(
-                std::runtime_error("GPU pipeline task exceeded maximum OOM retry limit (" +
-                                   std::to_string(MAX_OOM_RETRIES) + ") for original task " +
-                                   std::to_string(orig_task_id))));
+              _completion_handler->report_error(std::make_exception_ptr(std::runtime_error(
+                "GPU pipeline task exceeded maximum retry limit (" + std::to_string(MAX_RETRIES) +
+                ") for original task " + std::to_string(orig_task_id) + ": " + ex.what())));
             }
             return;
           }
 
           SIRIUS_LOG_WARN(
-            "GPU Pipeline Executor: OOM reschedule (retry {}/{}) for task {} (original task {}), "
-            "resuming from operator index {}",
+            "GPU Pipeline Executor: reschedule (retry {}/{}) for task {} (original task {}), "
+            "resuming from operator index {}: {}",
             next_retry_count,
-            MAX_OOM_RETRIES,
+            MAX_RETRIES,
             gpu_task->get_task_id(),
             orig_task_id,
-            oom.get_resume_operator_index());
+            ex.get_resume_operator_index(),
+            ex.what());
 
-          auto intermediate_data = oom.release_intermediate_data();
+          auto intermediate_data = ex.release_intermediate_data();
           if (auto pipelineable_data =
                 dynamic_cast<op::pipelineable_operator_data*>(intermediate_data.get())) {
             // We want to release the read-only lock on the data so that when its added back to the
@@ -376,7 +383,7 @@ void gpu_pipeline_executor::manager_loop()
 
           // Build the rescheduled task via virtual factory (preserves derived type).
           auto new_local_state = std::make_unique<gpu_pipeline_task_local_state>(
-            std::move(intermediate_data), oom.get_resume_operator_index());
+            std::move(intermediate_data), ex.get_resume_operator_index());
           new_local_state->retry_count      = next_retry_count;
           new_local_state->original_task_id = orig_task_id;
 
@@ -438,11 +445,8 @@ void gpu_pipeline_executor::manager_loop()
         // which may destroy the engine and its operators. We must not schedule
         // tasks that reference those operators after signaling completion.
         bool query_complete = false;
-        if (_completion_handler && pipeline) {
-          auto sink = pipeline->get_sink();
-          if (sink && sink->type == op::SiriusPhysicalOperatorType::RESULT_COLLECTOR) {
-            query_complete = pipeline->is_pipeline_finished();
-          }
+        if (_completion_handler && pipeline && pipeline->is_query_terminal()) {
+          query_complete = pipeline->is_pipeline_finished();
         }
 
         if (!query_complete && _task_creator) {
@@ -476,6 +480,11 @@ void gpu_pipeline_executor::set_task_creator(sirius::creator::task_creator* task
 }
 
 bool gpu_pipeline_executor::is_task_queue_empty() const noexcept { return _task_queue.is_empty(); }
+
+executor_metrics gpu_pipeline_executor::get_metrics() const noexcept
+{
+  return {_tasks_executed.load(std::memory_order_relaxed)};
+}
 
 void gpu_pipeline_executor::set_completion_handler(completion_handler* handler) noexcept
 {

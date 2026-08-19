@@ -19,9 +19,12 @@
 #include "data/sirius_converter_registry.hpp"
 #include "helper/type_conversions.hpp"
 #include "memory/sirius_memory_reservation_manager.hpp"
+#include "op/scan/sirius_gpu_scan_operator.hpp"
+#include "op/scan/sirius_gpu_scan_operator_data.hpp"
 #include "op/sirius_physical_operator.hpp"
 #include "pipeline/gpu_pipeline_task.hpp"
 #include "pipeline/oom_reschedule_exception.hpp"
+#include "pipeline/repository_wiring.hpp"
 #include "pipeline/sirius_pipeline.hpp"
 #include "pipeline/sirius_pipeline_task_states.hpp"
 #include "utils/telemetry_utils.hpp"
@@ -85,6 +88,33 @@ class stub_operator : public sirius::op::sirius_physical_operator {
   bool acts_as_sink = false;
 };
 
+// Minimal idata_representation stub that reports different compressed vs uncompressed
+// sizes without requiring the full compressed_host_representation infrastructure.
+// Used to test the peak_materialization_bytes logic in get_estimated_bytes_to_materialize_input.
+class fake_compressed_representation : public cucascade::idata_representation {
+ public:
+  fake_compressed_representation(cucascade::memory::memory_space& host_space,
+                                 std::size_t compressed,
+                                 std::size_t uncompressed)
+    : idata_representation(host_space), compressed_(compressed), uncompressed_(uncompressed)
+  {
+  }
+  [[nodiscard]] std::size_t get_size_in_bytes() const override { return compressed_; }
+  [[nodiscard]] std::size_t get_uncompressed_data_size_in_bytes() const override
+  {
+    return uncompressed_;
+  }
+  [[nodiscard]] std::unique_ptr<cucascade::idata_representation> clone(
+    rmm::cuda_stream_view) override
+  {
+    return nullptr;
+  }
+
+ private:
+  std::size_t compressed_;
+  std::size_t uncompressed_;
+};
+
 class scan_sizing_input : public sirius::op::operator_data {
  public:
   [[nodiscard]] sirius::op::operator_data_type get_type() const override
@@ -110,10 +140,10 @@ struct pipeline_task_history_fixture {
       builder.set_number_of_gpus(1)
         .set_gpu_usage_limit(kGpuCapacity)
         .set_reservation_fraction_per_gpu(0.95)
-        .set_per_host_capacity(1ULL * 1024 * 1024 * 1024)
-        .use_host_per_gpu()
+        .set_per_numa_region_capacity(1ULL * 1024 * 1024 * 1024)
+        .use_gpu_id_as_host_id()
         .track_reservation_per_stream(false)
-        .set_reservation_fraction_per_host(0.75);
+        .set_reservation_fraction_per_numa_region(0.75);
       auto space_configs = builder.build();
       manager            = std::make_unique<sirius::memory::sirius_memory_reservation_manager>(
         std::move(space_configs));
@@ -161,17 +191,23 @@ struct pipeline_task_history_fixture {
     return batch;
   }
 
-  /// Create a data batch that stays on GPU.
-  std::shared_ptr<cucascade::data_batch> create_gpu_data_batch(std::size_t num_rows,
-                                                               rmm::cuda_stream_view stream)
+  /// Create a data batch that looks like a compressed host batch with known sizes.
+  std::shared_ptr<cucascade::data_batch> create_compressed_host_data_batch(
+    std::size_t compressed_bytes, std::size_t uncompressed_bytes)
   {
-    auto gpu_mr = gpu_space->get_default_allocator();
-    auto gpu_table =
-      sirius::create_cudf_table_with_random_data(num_rows,
-                                                 {cudf::data_type{cudf::type_id::INT64}},
-                                                 {std::make_pair(0, 1000000)},
-                                                 stream,
-                                                 gpu_mr);
+    auto rep = std::make_unique<fake_compressed_representation>(
+      *host_space, compressed_bytes, uncompressed_bytes);
+    auto batch_id = sirius::get_next_batch_id();
+    return cucascade::data_batch::make(batch_id, std::move(rep));
+  }
+
+  /// Create a data batch that stays on GPU.
+  std::shared_ptr<cucascade::data_batch> create_gpu_data_batch(
+    std::size_t num_rows, rmm::cuda_stream_view stream, cudf::type_id type = cudf::type_id::INT64)
+  {
+    auto gpu_mr    = gpu_space->get_default_allocator();
+    auto gpu_table = sirius::create_cudf_table_with_random_data(
+      num_rows, {cudf::data_type{type}}, {std::make_pair(0, 1000000)}, stream, gpu_mr);
     stream.synchronize();
 
     auto batch = sirius::make_data_batch(
@@ -202,6 +238,30 @@ pipeline_context create_pipeline_context()
   build_state.set_pipeline_source(*ctx.pipeline, *ctx.stub_source);
   build_state.add_pipeline_operator(*ctx.pipeline, *ctx.stub_op);
   build_state.set_pipeline_sink(*ctx.pipeline, *ctx.stub_op, 1);
+
+  // Number the stubs as the converter does in production; task execution reads operator ids.
+  duckdb::vector<duckdb::shared_ptr<sirius::pipeline::sirius_pipeline>> pipelines{ctx.pipeline};
+  sirius::pipeline::assign_operator_ids(pipelines);
+  return ctx;
+}
+
+struct cached_scan_pipeline_context {
+  duckdb::shared_ptr<sirius::pipeline::sirius_pipeline> pipeline;
+  std::unique_ptr<sirius::op::scan::sirius_gpu_scan_operator> scan_op;
+};
+
+cached_scan_pipeline_context create_cached_scan_pipeline_context()
+{
+  cached_scan_pipeline_context ctx;
+  const sirius::pipeline::pipeline_build_context build_ctx{nullptr, true};
+  ctx.pipeline = duckdb::make_shared_ptr<sirius::pipeline::sirius_pipeline>(build_ctx);
+  ctx.pipeline->set_pipeline_id(43);
+  ctx.scan_op = std::make_unique<sirius::op::scan::sirius_gpu_scan_operator>(
+    duckdb::vector<sirius::logical_type>{}, 0, nullptr);
+
+  sirius::pipeline::sirius_pipeline_build_state build_state;
+  build_state.set_pipeline_source(*ctx.pipeline, *ctx.scan_op);
+  build_state.add_pipeline_operator(*ctx.pipeline, *ctx.scan_op);
   return ctx;
 }
 
@@ -279,7 +339,162 @@ std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_pipeline_task(
 
   return task;
 }
+
+std::unique_ptr<sirius::pipeline::gpu_pipeline_task> create_cached_scan_task(
+  std::shared_ptr<sirius::pipeline::sirius_pipeline_task_global_state> global_state,
+  std::shared_ptr<cucascade::data_batch> batch,
+  int task_id,
+  bool needs_carrier_conversion            = false,
+  std::size_t conversion_destination_bytes = 0)
+{
+  auto op_data = std::make_unique<sirius::op::scan::scan_operator_input>(std::move(batch));
+  op_data->needs_carrier_conversion     = needs_carrier_conversion;
+  op_data->conversion_destination_bytes = conversion_destination_bytes;
+  return std::make_unique<sirius::pipeline::gpu_pipeline_task>(
+    task_id,
+    std::vector<cucascade::shared_data_repository*>{},
+    std::make_unique<sirius::pipeline::gpu_pipeline_task_local_state>(std::move(op_data)),
+    std::move(global_state));
+}
 }  // namespace
+
+TEST_CASE("cached scan input materialization contributes to task reservations",
+          "[gpu_pipeline_task][history][scan]")
+{
+  constexpr std::size_t kInputNumRows = 1024;
+
+  pipeline_task_history_fixture f;
+  if (!f.setup()) {
+    WARN("Skipping test — no GPU available");
+    return;
+  }
+
+  rmm::cuda_stream stream;
+  auto ctx          = create_cached_scan_pipeline_context();
+  auto global_state = std::make_shared<sirius::pipeline::sirius_pipeline_task_global_state>(
+    ctx.pipeline, sirius::test::make_test_telemetry_context());
+
+  SECTION("HOST-cached input adds its upload size")
+  {
+    auto batch = f.create_host_data_batch(kInputNumRows, stream);
+    std::size_t input_basis;
+    std::size_t materialization_bytes;
+    {
+      auto ro               = batch->to_read_only();
+      input_basis           = ro.get_data()->get_size_in_bytes();
+      materialization_bytes = ro.get_data()->get_uncompressed_data_size_in_bytes();
+      REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::HOST);
+    }
+    REQUIRE(input_basis > 0);
+    REQUIRE(materialization_bytes > 0);
+
+    auto task = create_cached_scan_task(global_state, batch, 1);
+    auto info = task->get_estimated_reservation_size_info(nullptr);
+    REQUIRE(info.input_basis == input_basis);
+    REQUIRE(info.bytes_to_materialize_input == materialization_bytes);
+    REQUIRE_FALSE(info.had_history);
+    REQUIRE(info.peak_memory_estimate == input_basis);
+    REQUIRE(info.reservation_size == input_basis + materialization_bytes);
+
+    global_state->get_memory_history().record({input_basis, input_basis / 2, input_basis});
+    auto task_with_history = create_cached_scan_task(global_state, batch, 2);
+    auto info_with_history = task_with_history->get_estimated_reservation_size_info(nullptr);
+    REQUIRE(info_with_history.had_history);
+    REQUIRE(info_with_history.peak_memory_estimate == input_basis / 2);
+    REQUIRE(info_with_history.reservation_size == input_basis / 2 + materialization_bytes);
+  }
+
+  SECTION("HOST-cached COMPRESSED input accounts for staged payload")
+  {
+    // A compressed host batch has get_size_in_bytes() < get_uncompressed_data_size_in_bytes().
+    // During H2D materialization both the compressed payload and the decompressed output are
+    // simultaneously resident on device, so the peak = compressed + uncompressed.
+    constexpr std::size_t compressed_bytes   = 1000;
+    constexpr std::size_t uncompressed_bytes = 4000;
+    auto batch = f.create_compressed_host_data_batch(compressed_bytes, uncompressed_bytes);
+    {
+      auto ro = batch->to_read_only();
+      REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::HOST);
+      REQUIRE(ro.get_data()->get_size_in_bytes() == compressed_bytes);
+      REQUIRE(ro.get_data()->get_uncompressed_data_size_in_bytes() == uncompressed_bytes);
+    }
+
+    auto task = create_cached_scan_task(global_state, batch, 1);
+    auto info = task->get_estimated_reservation_size_info(nullptr);
+    // input_basis = max(compressed, uncompressed) = uncompressed (scan working set)
+    REQUIRE(info.input_basis == uncompressed_bytes);
+    // bytes_to_materialize must include the compressed payload staged on device + the output
+    REQUIRE(info.bytes_to_materialize_input == compressed_bytes + uncompressed_bytes);
+    REQUIRE_FALSE(info.had_history);
+    REQUIRE(info.peak_memory_estimate == uncompressed_bytes);
+    REQUIRE(info.reservation_size == uncompressed_bytes + compressed_bytes + uncompressed_bytes);
+  }
+
+  SECTION("GPU-cached input does not add an upload size")
+  {
+    auto batch = f.create_gpu_data_batch(kInputNumRows, stream);
+    std::size_t input_basis;
+    {
+      auto ro     = batch->to_read_only();
+      input_basis = ro.get_data()->get_size_in_bytes();
+      REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
+    }
+    REQUIRE(input_basis > 0);
+
+    auto task = create_cached_scan_task(global_state, std::move(batch), 1);
+    auto info = task->get_estimated_reservation_size_info(nullptr);
+    REQUIRE(info.input_basis == input_basis);
+    REQUIRE(info.bytes_to_materialize_input == 0);
+    REQUIRE_FALSE(info.had_history);
+    REQUIRE(info.peak_memory_estimate == input_basis);
+    REQUIRE(info.reservation_size == input_basis);
+  }
+
+  SECTION("history includes an exact carrier-conversion destination")
+  {
+    auto batch = f.create_gpu_data_batch(kInputNumRows, stream, cudf::type_id::INT32);
+    std::size_t input_basis;
+    {
+      auto ro     = batch->to_read_only();
+      input_basis = ro.get_data()->get_size_in_bytes();
+      REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
+    }
+    REQUIRE(input_basis > 0);
+    auto const destination_bytes = kInputNumRows * sizeof(int64_t);
+    REQUIRE(destination_bytes > input_basis);
+
+    global_state->get_memory_history().record({input_basis, input_basis / 2, input_basis});
+    auto task = create_cached_scan_task(global_state, std::move(batch), 1, true, destination_bytes);
+    auto info = task->get_estimated_reservation_size_info(nullptr);
+    REQUIRE(info.input_basis == input_basis);
+    REQUIRE(info.bytes_to_materialize_input == 0);
+    REQUIRE(info.had_history);
+    REQUIRE(info.peak_memory_estimate == input_basis + destination_bytes);
+    REQUIRE(info.reservation_size == input_basis + destination_bytes);
+  }
+
+  SECTION("history uses the conservative carrier-conversion bound when destination is unknown")
+  {
+    auto batch = f.create_gpu_data_batch(kInputNumRows, stream);
+    std::size_t input_basis;
+    {
+      auto ro     = batch->to_read_only();
+      input_basis = ro.get_data()->get_size_in_bytes();
+      REQUIRE(ro.get_current_tier() == cucascade::memory::Tier::GPU);
+    }
+    REQUIRE(input_basis > 0);
+
+    global_state->get_memory_history().record({input_basis, input_basis / 2, input_basis});
+    auto task = create_cached_scan_task(global_state, std::move(batch), 1, true, 0);
+    auto info = task->get_estimated_reservation_size_info(nullptr);
+    auto const conversion_floor = input_basis + input_basis * 8;
+    REQUIRE(info.input_basis == input_basis);
+    REQUIRE(info.bytes_to_materialize_input == 0);
+    REQUIRE(info.had_history);
+    REQUIRE(info.peak_memory_estimate == conversion_floor);
+    REQUIRE(info.reservation_size == conversion_floor);
+  }
+}
 
 TEST_CASE("scan working set is a lower bound for history-based reservations",
           "[gpu_pipeline_task][history][scan]")

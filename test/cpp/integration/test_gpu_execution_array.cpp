@@ -58,6 +58,33 @@ TEST_CASE_METHOD(ArrayFixture,
 }
 
 TEST_CASE_METHOD(ArrayFixture,
+                 "gpu_execution array - fully NULL array column",
+                 "[integration][gpu_execution][array][scan]")
+{
+  // Whole-column NULLs checkpoint to CONSTANT all-null array-level validity;
+  // the decoder must synthesize the null mask rather than treat it as valid.
+  run_ok("CREATE TABLE arr_allnull (id INTEGER, a INTEGER[3]);");
+  run_ok("INSERT INTO arr_allnull SELECT range::INTEGER, NULL::INTEGER[3] FROM range(3000);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu("SELECT id, a FROM arr_allnull ORDER BY id;");
+  compare_gpu_vs_cpu("SELECT count(*), count(a) FROM arr_allnull;");
+}
+
+TEST_CASE_METHOD(ArrayFixture,
+                 "gpu_execution array - arrays of all-NULL elements",
+                 "[integration][gpu_execution][array][scan]")
+{
+  // Present arrays whose elements are all NULL: CONSTANT all-null child
+  // validity, decoded via the synthesized zero-bit path.
+  run_ok("CREATE TABLE arr_nullelems (id INTEGER, a INTEGER[3]);");
+  run_ok(
+    "INSERT INTO arr_nullelems SELECT range::INTEGER, "
+    "[NULL, NULL, NULL]::INTEGER[3] FROM range(3000);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu("SELECT id, a FROM arr_nullelems ORDER BY id;");
+}
+
+TEST_CASE_METHOD(ArrayFixture,
                  "gpu_execution array - element types DOUBLE and BIGINT",
                  "[integration][gpu_execution][array][scan]")
 {
@@ -282,6 +309,48 @@ TEST_CASE_METHOD(ArrayFixture,
   compare_gpu_vs_cpu("SELECT id, a FROM arr_null_big;");
 }
 
+TEST_CASE_METHOD(ArrayFixture,
+                 "gpu_execution array - NULL arrays survive an ORDER BY",
+                 "[integration][gpu_execution][array][nulls]")
+{
+  // Regression: once a gather (ORDER BY) sorts a LIST column holding NULL arrays,
+  // cudf compacts the NULL rows' children out, so the values child is no longer
+  // fixed-stride. copy_array reads the LIST offsets to place each row's children
+  // at their array_size slot; a fixed-stride read would shift elements across
+  // rows. Mix whole-array NULLs with child-element NULLs so both validity levels
+  // ride through the sort. Every other null-array test omits ORDER BY.
+  run_ok("CREATE TABLE arr_null_sort (id INTEGER, a INTEGER[3]);");
+  run_ok(
+    "INSERT INTO arr_null_sort VALUES "
+    "(1, [1, 2, 3]), (2, NULL), (3, [NULL, 5, NULL]), (4, [7, NULL, 9]), (5, NULL);");
+  run_ok("CHECKPOINT;");
+  // DESC so the sort's gather actually permutes the null rows out of input order.
+  compare_gpu_vs_cpu_ordered("SELECT id, a FROM arr_null_sort ORDER BY id DESC;");
+}
+
+TEST_CASE_METHOD(ArrayFixture,
+                 "gpu_execution array - NULL arrays survive an ORDER BY across scan batches",
+                 "[integration][gpu_execution][array][nulls]")
+{
+  // Multi-batch regression for the compacted-child read-back. After ORDER BY
+  // compacts NULL arrays' children out, a later 2048-row window with no NULL
+  // arrays takes copy_array's fast path, but its element mask no longer starts
+  // at row_offset*array_size, it starts at the compacted base (and unaligned).
+  // Cluster whole-array NULLs early (ids 1000-1099) so the first window is
+  // compacted (slow path) and later windows are dense (fast path reading from the
+  // shifted base); element-level NULLs everywhere keep the child mask exercised.
+  // 5000 rows > STANDARD_VECTOR_SIZE (2048) forces multiple scan batches.
+  run_ok("CREATE TABLE arr_null_sort_big (id INTEGER, a INTEGER[3]);");
+  run_ok(
+    "INSERT INTO arr_null_sort_big SELECT i, "
+    "CASE WHEN i BETWEEN 1000 AND 1099 THEN NULL "
+    "WHEN i % 7 = 0 THEN [NULL, i + 1, NULL] "
+    "ELSE [i, i + 1, i + 2] END "
+    "FROM range(5000) t(i);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu_ordered("SELECT id, a FROM arr_null_sort_big ORDER BY id;");
+}
+
 //===----------------------------------------------------------------------===//
 // CONSTANT-compressed child data
 //===----------------------------------------------------------------------===//
@@ -394,6 +463,16 @@ TEST_CASE_METHOD(ArrayFixture,
   run_ok("INSERT INTO arr_filter VALUES (1, [1, 1]), (2, [2, 2]), (3, [3, 3]), (4, [4, 4]);");
   run_ok("CHECKPOINT;");
   compare_gpu_vs_cpu("SELECT id, a FROM arr_filter WHERE id >= 3;");
+}
+
+TEST_CASE_METHOD(ArrayFixture,
+                 "gpu_execution array - array projected while a filter prunes a row group",
+                 "[integration][gpu_execution][array][filter]")
+{
+  run_ok("CREATE TABLE arr_prune (id INTEGER, a INTEGER[3]);");
+  run_ok("INSERT INTO arr_prune SELECT i, [i, i + 1, i + 2] FROM range(200000) t(i);");
+  run_ok("CHECKPOINT;");
+  compare_gpu_vs_cpu("SELECT id, a FROM arr_prune WHERE id >= 150000;");
 }
 
 //===----------------------------------------------------------------------===//

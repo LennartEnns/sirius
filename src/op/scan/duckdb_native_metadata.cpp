@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
@@ -51,6 +52,18 @@
 #include <vector>
 
 namespace sirius::op::scan {
+
+std::size_t metadata_parse_chunk()
+{
+  constexpr std::size_t kDefaultParseChunk = 8;
+  if (const char* env = std::getenv("SIRIUS_METADATA_PARSE_CHUNK")) {
+    try {
+      if (const auto v = std::stoull(env); v > 0) return static_cast<std::size_t>(v);
+    } catch (...) { /* fall through to default */
+    }
+  }
+  return kDefaultParseChunk;
+}
 
 namespace {
 
@@ -153,7 +166,21 @@ duckdb_segment_descriptor fill_segment_descriptor(duckdb::ColumnSegment& segment
     collect_block_ids visitor(desc.additional_blocks);
     cf.visit_block_ids(segment, visitor);
   }
+  if (desc.compression == duckdb::CompressionType::COMPRESSION_CONSTANT) {
+    // Snapshot the segment's own stats: the constant value lives here, and
+    // row-group-level stats drift as later appends merge into them.
+    desc.segment_stats = std::make_shared<duckdb::BaseStatistics>(segment.stats.statistics.Copy());
+  }
   return desc;
+}
+
+// A CONSTANT validity segment is uniform, with the direction in its stats:
+// all-valid decodes to nothing, all-NULL carries the marker so the decoder
+// synthesizes zero validity bits.
+bool constant_validity_is_all_null(duckdb::ColumnSegment& segment)
+{
+  return segment.GetCompressionFunction().type == duckdb::CompressionType::COMPRESSION_CONSTANT &&
+         segment.stats.statistics.CanHaveNull();
 }
 
 // Grants access to ArrayColumnData's protected child/validity members. C++
@@ -212,7 +239,9 @@ std::optional<std::string> walk_array_column(duckdb::ColumnData& col_data,
                " row group " + std::to_string(rg_idx) + ": unsupported compression " +
                duckdb::CompressionTypeToString(compression);
       }
-      out.push_back(fill_segment_descriptor(segment, node.GetRowStart()));
+      auto desc     = fill_segment_descriptor(segment, node.GetRowStart());
+      desc.all_null = constant_validity_is_all_null(segment);
+      out.push_back(std::move(desc));
     }
     return std::nullopt;
   };
@@ -319,7 +348,9 @@ std::optional<std::string> walk_standard_column(duckdb::ColumnData& col_data,
              std::to_string(rg_idx) + ": unsupported compression " +
              duckdb::CompressionTypeToString(compression);
     }
-    col_md.validity_segments.push_back(fill_segment_descriptor(segment, node.GetRowStart()));
+    auto desc     = fill_segment_descriptor(segment, node.GetRowStart());
+    desc.all_null = constant_validity_is_all_null(segment);
+    col_md.validity_segments.push_back(std::move(desc));
   }
   return std::nullopt;
 }
@@ -381,6 +412,12 @@ std::size_t estimate_decoded_bytes_budget(duckdb::idx_t row_count,
       // String payload bytes require segment-level max-string stats. At prepare
       // time we can only account for offsets; this counter is diagnostic.
       budget += static_cast<std::size_t>(row_count) * sizeof(std::uint32_t);
+    } else if (projected_types[ci].is_array()) {
+      // ARRAY: offsets (int32) + child values (array_size × child_width × row_count).
+      auto const array_size  = projected_types[ci].array_size();
+      auto const child_width = projected_types[ci].array_child().fixed_width_byte_size();
+      budget +=
+        static_cast<std::size_t>(row_count) * (sizeof(std::int32_t) + array_size * child_width);
     } else {
       budget += static_cast<std::size_t>(row_count) * projected_types[ci].fixed_width_byte_size();
     }
@@ -466,7 +503,9 @@ bool is_supported_data_compression(duckdb::CompressionType c)
 bool is_supported_validity_compression(duckdb::CompressionType c)
 {
   switch (c) {
-    // CONSTANT is the all-valid case (all-null columns land in EMPTY).
+    // CONSTANT validity is uniform — all-valid or all-NULL, disambiguated by
+    // the segment stats (see constant_validity_is_all_null). EMPTY means the
+    // base data codec covers validity itself.
     // ROARING is host-decoded to a plain bitmap before the GPU sees it.
     case duckdb::CompressionType::COMPRESSION_UNCOMPRESSED:
     case duckdb::CompressionType::COMPRESSION_EMPTY:

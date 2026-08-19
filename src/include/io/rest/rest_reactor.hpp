@@ -62,6 +62,15 @@ struct footer_probe {
   std::size_t object_size{0};
   std::size_t window_lo{0};
   std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+  // ETag from the verified 206, quotes preserved; empty otherwise.
+  std::string etag;
+};
+
+/// Result of a blocking HEAD: the object's size plus its ETag when the server
+/// sent one (quotes preserved, empty otherwise).
+struct head_object_result {
+  std::size_t object_size{0};
+  std::string etag;
 };
 
 // ---------------------------------------------------------------------------
@@ -77,8 +86,13 @@ struct footer_probe {
  */
 class rest_io_object : public sirius_io_object {
  public:
-  rest_io_object(std::string path, std::string bucket, std::string key, size_t size)
-    : _path(std::move(path)), _bucket(std::move(bucket)), _key(std::move(key)), _file_size(size)
+  rest_io_object(
+    std::string path, std::string bucket, std::string key, size_t size, std::string etag = {})
+    : _path(std::move(path)),
+      _bucket(std::move(bucket)),
+      _key(std::move(key)),
+      _file_size(size),
+      _etag(std::move(etag))
   {
   }
 
@@ -90,19 +104,22 @@ class rest_io_object : public sirius_io_object {
                  std::string key,
                  size_t object_size,
                  size_t window_lo,
-                 std::shared_ptr<const std::vector<std::uint8_t>> stash)
+                 std::shared_ptr<const std::vector<std::uint8_t>> stash,
+                 std::string etag = {})
     : _path(std::move(path)),
       _bucket(std::move(bucket)),
       _key(std::move(key)),
       _file_size(object_size),
       _window_lo(window_lo),
-      _stash(std::move(stash))
+      _stash(std::move(stash)),
+      _etag(std::move(etag))
   {
   }
 
   [[nodiscard]] const std::string& raw_file_cache_id() const noexcept override { return _path; }
   [[nodiscard]] const std::string& object_path() const noexcept override { return _path; }
   [[nodiscard]] size_t size() const noexcept override { return _file_size; }
+  [[nodiscard]] std::string_view validation_etag() const noexcept override { return _etag; }
 
   [[nodiscard]] const std::string& bucket() const noexcept { return _bucket; }
   [[nodiscard]] const std::string& key() const noexcept { return _key; }
@@ -124,6 +141,7 @@ class rest_io_object : public sirius_io_object {
   size_t _file_size{0};
   size_t _window_lo{0};
   std::shared_ptr<const std::vector<std::uint8_t>> _stash;
+  std::string _etag;
 };
 
 // ---------------------------------------------------------------------------
@@ -151,6 +169,12 @@ struct rest_perf_snapshot {
   // over every completed curl attempt incl. retries / partial / failed bodies.
   // Not TLS/header/TCP-frame bytes — this is the S3-scan payload byte budget.
   std::uint64_t payload_bytes_read_total{0};
+  // perf_instrumentation-gated. Blocking host GETs remain part of chunk_get_*
+  // and are also attributed to blocking_host_get_*. Stash hits issue no GET and
+  // increment neither.
+  std::uint64_t blocking_host_get_count{0};
+  std::uint64_t blocking_host_get_wall_ns_total{0};
+  std::uint64_t blocking_host_get_wall_ns_max{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -225,7 +249,8 @@ class rest_reactor {
 
   static request_type_ptr prep_host_rx_request(const reactor_config_type& cfg,
                                                const io_object_type& file,
-                                               const io_object_segment& segment);
+                                               const io_object_segment& segment,
+                                               bool perf_blocking_host_get = false);
 
   static request_type_ptr prep_host_rxv_request(const reactor_config_type& cfg,
                                                 const io_object_type& file,
@@ -264,17 +289,28 @@ class rest_reactor {
   /// Synchronous buffered host read (blocking ranged GET).  Blocks the caller.
   size_t host_read(const io_object_type& file, size_t offset, size_t size, uint8_t* dst);
 
-  /// Blocking HEAD to discover an object's size.  Used by the ioctx to build
-  /// an @c rest_io_object.  @p bucket / @p key identify the object.
-  size_t head_object_size(std::string_view bucket, std::string_view key);
+  /// Blocking HEAD to discover an object's size and ETag.  Used by the ioctx to
+  /// build an @c rest_io_object.  @p bucket / @p key identify the object.
+  head_object_result head_object_size(std::string_view bucket, std::string_view key);
 
   /// Blocking suffix-range GET of the last @p n bytes of an object, resolving
   /// the size and stashing the parquet footer in a single round-trip.  On a
   /// well-formed 206 the returned @c footer_probe carries the object size, the
-  /// window origin, and the trailing bytes; on any unusable response (200 full
-  /// body, missing / unsatisfied Content-Range) @c bytes is null so the caller
+  /// window origin, the trailing bytes, and the ETag; on any unusable response
+  /// (200 full body, missing / unsatisfied Content-Range) @c bytes is null so the caller
   /// falls back to a HEAD.  @p bucket / @p key identify the object.
   footer_probe fetch_footer_suffix(std::string_view bucket, std::string_view key, std::size_t n);
+
+  /// Blocking bucket-level ListObjectsV2 GET for one page: returns the raw XML
+  /// body on HTTP 200.  @p canonical_query is the pre-encoded, key-sorted
+  /// request query (no auth params — authorization is added via
+  /// @c authorize_list).  @p prefix is only for retry-log / error text.
+  /// Control-plane op: retries/terminals are counted (and retries WARN-logged)
+  /// like every retry loop here, but the XML body never touches the
+  /// chunk-GET / payload byte counters.
+  std::string list_page(std::string_view bucket,
+                        std::string_view prefix,
+                        std::string_view canonical_query);
 
   /// Snapshot of this reactor's perf counters.  Lock-free (relaxed atomic
   /// loads); safe to call while the reactor is running.
@@ -347,6 +383,9 @@ class rest_reactor {
     std::atomic<std::uint64_t> terminal_failures_total{0};
     std::atomic<std::uint64_t> device_stream_sync_total{0};
     std::atomic<std::uint64_t> payload_bytes_read_total{0};
+    std::atomic<std::uint64_t> blocking_host_get_count{0};
+    std::atomic<std::uint64_t> blocking_host_get_wall_ns_total{0};
+    std::atomic<std::uint64_t> blocking_host_get_wall_ns_max{0};
   };
   perf_counters _perf;
 

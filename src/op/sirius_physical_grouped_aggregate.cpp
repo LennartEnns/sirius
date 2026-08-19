@@ -26,17 +26,6 @@
 namespace sirius {
 namespace op {
 
-void sirius_physical_grouped_aggregate::build_pipelines(
-  pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
-{
-  // The bare DISTINCT of a RIGHT_DELIM_JOIN contributes no pipeline of its own: the
-  // delim join's sink executes it inline and the tree-based wiring handles data flow.
-  // is_sink() stays true — PARTITION_distinct asserts `children[0]->is_sink()`, which
-  // is about the operator's role, not pipeline membership.
-  if (_owned_by_delim_join) { return; }
-  sirius_physical_operator::build_pipelines(current, meta_pipeline);
-}
-
 sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   duckdb::vector<sirius::logical_type> types,
   duckdb::vector<std::unique_ptr<sirius::ast::node>> expressions,
@@ -81,6 +70,24 @@ sirius_physical_grouped_aggregate::sirius_physical_grouped_aggregate(
   aggregate_slots                   = std::move(cudf_defs.aggregate_slots);
   has_avg                           = cudf_defs.has_avg;
   has_count_distinct                = cudf_defs.has_count_distinct;
+}
+
+duckdb::vector<sirius::logical_type>
+sirius_physical_grouped_aggregate::get_count_distinct_local_output_types() const
+{
+  auto const aggregate_offset = group_idx.size();
+  if (!has_count_distinct || has_avg || types.size() != aggregate_offset + aggregate_slots.size()) {
+    throw std::runtime_error(
+      "COUNT(DISTINCT) local schema requires a non-AVG one-slot-per-aggregate layout");
+  }
+
+  auto local_types = types;
+  for (size_t slot_idx = 0; slot_idx < aggregate_slots.size(); ++slot_idx) {
+    if (aggregate_slots[slot_idx].is_count_distinct) {
+      local_types[aggregate_offset + slot_idx] = sirius::logical_type::make(sirius::type_id::LIST);
+    }
+  }
+  return local_types;
 }
 
 std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(

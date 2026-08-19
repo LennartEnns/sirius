@@ -9,10 +9,12 @@
 #include "io/io_context.hpp"
 #include "io/rest/rest_ioctx.hpp"
 #include "io/s3/s3_object_ref.hpp"
+#include "io/s3/sirius_httpfs.hpp"
 #include "io/s3/sirius_sigv4_authorizer.hpp"
 #include "sirius_context.hpp"
 #include "sirius_extension.hpp"
 #include "utils/s3_container.hpp"
+#include "utils/tpch_queries.hpp"
 #include "utils/transparent_execution_test_utils.hpp"
 
 #include <cudf/io/experimental/hybrid_scan.hpp>
@@ -31,6 +33,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -302,6 +305,8 @@ struct sirius_memory_limits {
   std::optional<std::size_t> rest_max_connections;
   std::optional<bool> use_sirius_datasource;
   std::optional<std::string> rest_footer_probe_bytes;
+  std::optional<std::size_t> rest_list_max_matches;
+  std::optional<std::size_t> rest_list_max_scanned;
   bool rest_perf_instrumentation{false};
 };
 
@@ -417,6 +422,12 @@ class sirius_config_env_guard {
     if (limits.rest_footer_probe_bytes.has_value()) {
       out << "        footer_probe_bytes: " << yaml_quote(*limits.rest_footer_probe_bytes) << "\n";
     }
+    if (limits.rest_list_max_matches.has_value()) {
+      out << "        list_max_matches: " << *limits.rest_list_max_matches << "\n";
+    }
+    if (limits.rest_list_max_scanned.has_value()) {
+      out << "        list_max_scanned: " << *limits.rest_list_max_scanned << "\n";
+    }
     if (limits.rest_perf_instrumentation) { out << "        perf_instrumentation: true\n"; }
     out.close();
     REQUIRE(out);
@@ -488,6 +499,13 @@ std::unique_ptr<duckdb::MaterializedQueryResult> require_query_ok(duckdb::Connec
   REQUIRE_FALSE(result->HasError());
   return std::unique_ptr<duckdb::MaterializedQueryResult>(
     static_cast<duckdb::MaterializedQueryResult*>(result.release()));
+}
+
+void query_or_throw_on_error(duckdb::Connection& con, std::string const& sql)
+{
+  auto result = con.Query(sql);
+  if (!result) { throw std::runtime_error("DuckDB returned a null query result"); }
+  if (result->HasError()) { result->ThrowError(); }
 }
 
 std::string gpu_execution_sql(std::string const& inner_sql)
@@ -611,6 +629,53 @@ void check_rows_equal_with_tolerant_columns(duckdb::MaterializedQueryResult& act
   }
 }
 
+void check_rows_equal_with_tolerant_columns(watchdog_query_result const& actual,
+                                            duckdb::MaterializedQueryResult& expected,
+                                            std::vector<duckdb::idx_t> const& tolerant_columns = {})
+{
+  REQUIRE(actual.row_count == expected.RowCount());
+  REQUIRE(actual.column_count == expected.ColumnCount());
+  for (duckdb::idx_t r = 0; r < actual.row_count; ++r) {
+    for (duckdb::idx_t c = 0; c < actual.column_count; ++c) {
+      auto const& actual_value  = actual.rows[r][c];
+      auto const expected_value = expected.GetValue(c, r).ToString();
+      INFO("row=" << r << " column=" << c);
+      if (std::find(tolerant_columns.begin(), tolerant_columns.end(), c) !=
+          tolerant_columns.end()) {
+        CHECK(std::stod(actual_value) ==
+              Approx(std::stod(expected_value)).epsilon(1e-10).margin(1e-8));
+      } else {
+        CHECK(actual_value == expected_value);
+      }
+    }
+  }
+}
+
+std::string lowercase(std::string value)
+{
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
+}
+
+void require_nested_operation_unsupported(s3_sql_fixture& fixture,
+                                          std::string const& sql,
+                                          std::string_view column_name)
+{
+  auto result = fixture.con.Query(gpu_execution_sql(sql));
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+
+  auto const error       = result->GetError();
+  auto const lower_error = lowercase(error);
+  INFO(error);
+  CHECK(lower_error.find("nested column operation") != std::string::npos);
+  CHECK((lower_error.find("unsupported") != std::string::npos ||
+         lower_error.find("not supported") != std::string::npos));
+  CHECK(error.find(std::string{column_name}) != std::string::npos);
+}
+
 fs::path local_parquet_path(s3_test_env const& env, std::string_view table)
 {
   return env.local_dir / "parquet" / (std::string{table} + ".parquet");
@@ -636,10 +701,25 @@ std::string local_parquet_file_scan(fs::path const& path)
   return "read_parquet(" + sql_quote(path.string()) + ")";
 }
 
+std::string local_parquet_glob_scan(s3_test_env const& env,
+                                    std::string_view pattern,
+                                    std::string_view options = {})
+{
+  return "read_parquet(" + sql_quote((env.local_dir / std::string{pattern}).string()) +
+         std::string{options} + ")";
+}
+
 std::string s3_parquet_scan(s3_test_env const& env, std::string_view table)
 {
   auto const key = "parquet/" + std::string{table} + ".parquet";
   return "read_parquet(" + sql_quote(s3_uri(env.bucket, key)) + ")";
+}
+
+std::string s3_parquet_glob_scan(s3_test_env const& env,
+                                 std::string_view pattern,
+                                 std::string_view options = {})
+{
+  return "read_parquet(" + sql_quote(s3_uri(env.bucket, pattern)) + std::string{options} + ")";
 }
 
 std::string s3_sirius_parquet_scan(s3_test_env const& env, std::string_view table)
@@ -686,6 +766,19 @@ sirius::io::rest::rest_ioctx& require_rest_ioctx(s3_sql_fixture& fixture, std::s
   auto* rest_ctx = dynamic_cast<sirius::io::rest::rest_ioctx*>(datasource->io_ctx().get());
   REQUIRE(rest_ctx != nullptr);
   return *rest_ctx;
+}
+
+void require_s3_keys_listed(s3_sql_fixture& fixture,
+                            s3_test_env const& env,
+                            std::vector<std::string_view> const& expected_keys)
+{
+  auto& rest  = require_rest_ioctx(fixture, s3_uri(env.bucket, "parquet/nation.parquet"));
+  auto listed = rest.list_objects(env.bucket, "glob-enc/");
+  for (auto const expected : expected_keys) {
+    INFO("expected LIST key=" << expected);
+    REQUIRE(std::any_of(
+      listed.begin(), listed.end(), [&](auto const& entry) { return entry.key == expected; }));
+  }
 }
 
 std::uint64_t rest_chunk_get_count(s3_sql_fixture& fixture, std::string const& uri)
@@ -804,6 +897,11 @@ sirius::io::rest::rest_perf_snapshot delta_snapshot(
     sat_sub(after.device_stream_sync_total, before.device_stream_sync_total);
   out.payload_bytes_read_total =
     sat_sub(after.payload_bytes_read_total, before.payload_bytes_read_total);
+  out.blocking_host_get_count =
+    sat_sub(after.blocking_host_get_count, before.blocking_host_get_count);
+  out.blocking_host_get_wall_ns_total =
+    sat_sub(after.blocking_host_get_wall_ns_total, before.blocking_host_get_wall_ns_total);
+  out.blocking_host_get_wall_ns_max = after.blocking_host_get_wall_ns_max;
   return out;
 }
 
@@ -949,6 +1047,14 @@ struct bench_record {
   std::uint64_t terminal_failures_total{0};
   std::uint64_t device_stream_sync_total{0};
   std::vector<metric_delta> comparisons;
+};
+
+struct tpch_bench_record {
+  std::string scenario;
+  std::string arm;
+  std::size_t query_number{0};
+  double wall_clock_ms{0.0};
+  duckdb::idx_t row_count{0};
 };
 
 bench_record make_record(std::string scenario,
@@ -1305,6 +1411,38 @@ void write_perf_json(fs::path const& path,
     }
     out << "}";
     out << (i + 1 == records.size() ? "\n" : ",\n");
+  }
+  out << "  ]\n";
+  out << "}\n";
+}
+
+void write_perf_json(fs::path const& path,
+                     s3_test_env const& env,
+                     std::string_view backend,
+                     std::string_view object_key,
+                     std::uint64_t dataset_bytes,
+                     std::vector<tpch_bench_record> const& records)
+{
+  fs::create_directories(path.parent_path());
+  std::ofstream out(path);
+  REQUIRE(out);
+
+  out << "{\n";
+  out << "  \"git_sha\": \"" << json_escape(env_or("SIRIUS_BENCH_GIT_SHA", "unknown")) << "\",\n";
+  out << "  \"host\": \"" << json_escape(env_or("HOSTNAME", "unknown")) << "\",\n";
+  out << "  \"backend\": \"" << json_escape(backend) << "\",\n";
+  out << "  \"dataset_bytes\": " << dataset_bytes << ",\n";
+  out << "  \"config\": {\"bucket\": \"" << json_escape(env.bucket) << "\", \"key\": \""
+      << json_escape(object_key) << "\"},\n";
+  out << "  \"results\": [\n";
+  for (std::size_t index = 0; index < records.size(); ++index) {
+    auto const& record = records[index];
+    out << "    {\"scenario\": \"" << json_escape(record.scenario) << "\", "
+        << "\"arm\": \"" << json_escape(record.arm) << "\", "
+        << "\"query_number\": " << record.query_number << ", "
+        << "\"wall_clock_ms\": " << std::fixed << std::setprecision(3) << record.wall_clock_ms
+        << ", \"row_count\": " << record.row_count << "}";
+    out << (index + 1 == records.size() ? "\n" : ",\n");
   }
   out << "  ]\n";
   out << "}\n";
@@ -1713,23 +1851,79 @@ void compare_transparent_s3_gpu_to_local_cpu(
   check_rows_equal_with_tolerant_columns(*s3_result, *local_result, tolerant_columns);
 }
 
-void compare_s3_gpu_to_local_cpu_with_watchdog(std::shared_ptr<s3_sql_fixture> const& fixture,
-                                               std::string_view label,
-                                               std::string const& s3_query,
-                                               std::string const& local_query,
-                                               std::chrono::seconds timeout)
+void compare_s3_gpu_to_local_cpu_with_watchdog(
+  std::shared_ptr<s3_sql_fixture> const& fixture,
+  std::string_view label,
+  std::string const& s3_query,
+  std::string const& local_query,
+  std::chrono::seconds timeout,
+  std::vector<duckdb::idx_t> const& tolerant_columns = {})
 {
-  INFO("shape-c case: " << label);
+  INFO("watchdog case: " << label);
   auto s3_result = require_query_ok_with_watchdog(fixture, gpu_execution_sql(s3_query), timeout);
 
   duckdb::DuckDB baseline_db(nullptr);
   duckdb::Connection baseline_con(baseline_db);
   auto local_result = require_query_ok(baseline_con, local_query);
-  auto local_rows   = collect_rows(*local_result);
 
-  REQUIRE(s3_result.row_count == local_result->RowCount());
-  REQUIRE(s3_result.column_count == local_result->ColumnCount());
-  CHECK(s3_result.rows == local_rows);
+  if (tolerant_columns.empty()) {
+    auto local_rows = collect_rows(*local_result);
+    REQUIRE(s3_result.row_count == local_result->RowCount());
+    REQUIRE(s3_result.column_count == local_result->ColumnCount());
+    CHECK(s3_result.rows == local_rows);
+  } else {
+    check_rows_equal_with_tolerant_columns(s3_result, *local_result, tolerant_columns);
+  }
+}
+
+constexpr std::array<std::string_view, 8> kBenchTpchTables = {
+  "nation", "region", "customer", "orders", "part", "partsupp", "supplier", "lineitem"};
+
+sirius_memory_limits tpch_sf1_bench_memory_limits()
+{
+  sirius_memory_limits limits;
+  limits.gpu_usage     = "2 GiB";
+  limits.host_capacity = "4 GiB";
+  limits.disk_capacity = "16 GiB";
+  return limits;
+}
+
+void create_tpch_bench_views(duckdb::Connection& connection, std::string const& root, bool s3)
+{
+  for (auto const table : kBenchTpchTables) {
+    auto const path = s3 ? root + "/" + std::string{table} + ".parquet"
+                         : (fs::path{root} / (std::string{table} + ".parquet")).string();
+    require_query_ok(connection,
+                     "CREATE OR REPLACE VIEW " + std::string{table} +
+                       " AS SELECT * FROM read_parquet(" + sql_quote(path) + ");");
+  }
+}
+
+tpch_bench_record run_tpch_bench_query(duckdb::Connection& connection,
+                                       sirius::test::tpch_query_spec const& query,
+                                       std::string arm)
+{
+  auto const start = bench_clock::now();
+  auto result      = connection.Query(std::string{query.sql});
+  auto const stop  = bench_clock::now();
+  if (!result)
+    throw std::runtime_error("TPC-H Q" + std::to_string(query.number) + " returned no result");
+  if (result->HasError()) throw std::runtime_error(result->GetError());
+
+  return tpch_bench_record{"tpch_q" + std::to_string(query.number) + "_" + arm,
+                           std::move(arm),
+                           query.number,
+                           elapsed_ms(start, stop),
+                           result->RowCount()};
+}
+
+std::uint64_t tpch_dataset_bytes(fs::path const& root)
+{
+  std::uint64_t bytes = 0;
+  for (auto const table : kBenchTpchTables) {
+    bytes += static_cast<std::uint64_t>(fs::file_size(root / (std::string{table} + ".parquet")));
+  }
+  return bytes;
 }
 
 }  // namespace
@@ -2088,6 +2282,66 @@ TEST_CASE("S3 REST perf benchmark emits HTTP and HTTPS JSON baseline", "[.][s3][
   WARN("Wrote S3 REST perf JSON baseline to " << path.string());
 }
 
+TEST_CASE("S3 TPC-H benchmark records SF1 S3 and local wall-clock arms", "[.][s3][bench][tpch]")
+{
+  if (!truthy_env("SIRIUS_BENCH_S3_TPCH")) {
+    SUCCEED("SIRIUS_BENCH_S3_TPCH is not enabled");
+    return;
+  }
+
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) return;
+
+  auto const local_dir_text = env_or("SIRIUS_TEST_S3_TPCH_LOCAL_DIR");
+  REQUIRE_FALSE(local_dir_text.empty());
+  fs::path const local_dir{local_dir_text};
+  for (auto const table : kBenchTpchTables) {
+    REQUIRE(fs::exists(local_dir / (std::string{table} + ".parquet")));
+  }
+
+  s3_sql_fixture fixture(*env, tpch_sf1_bench_memory_limits());
+  set_gpu_execution(fixture.con, true);
+  create_tpch_bench_views(fixture.con, s3_uri(env->bucket, "tpch/sf1"), true);
+
+  duckdb::DuckDB local_db(nullptr);
+  duckdb::Connection local_connection(local_db);
+  create_tpch_bench_views(local_connection, local_dir.string(), false);
+
+  std::vector<tpch_bench_record> records;
+  records.reserve(sirius::test::kTpchQueries.size() * 2);
+  for (auto const& query : sirius::test::kTpchQueries) {
+    tpch_bench_record s3_record;
+    try {
+      s3_record = run_tpch_bench_query(fixture.con, query, "s3");
+    } catch (std::exception const& first_error) {
+      if (!query.retry_once) throw;
+      WARN("TPC-H Q" << query.number << " S3 benchmark first attempt failed; retrying once: "
+                     << first_error.what());
+      s3_record = run_tpch_bench_query(fixture.con, query, "s3");
+    }
+    auto local_record = run_tpch_bench_query(local_connection, query, "local");
+
+    CHECK(s3_record.row_count == local_record.row_count);
+    WARN("TPC-H Q" << query.number << " S3=" << s3_record.wall_clock_ms << "ms local="
+                   << local_record.wall_clock_ms << "ms rows=" << s3_record.row_count);
+    records.push_back(std::move(s3_record));
+    records.push_back(std::move(local_record));
+  }
+  REQUIRE(records.size() == 44);
+
+  auto const path = perf_json_path();
+  write_perf_json(
+    path, *env, "rest_minio_tpch", "tpch/sf1", tpch_dataset_bytes(local_dir), records);
+  auto const json = read_text_file(path);
+  for (auto const& query : sirius::test::kTpchQueries) {
+    CHECK(json.find("\"scenario\": \"tpch_q" + std::to_string(query.number) + "_s3\"") !=
+          std::string::npos);
+    CHECK(json.find("\"scenario\": \"tpch_q" + std::to_string(query.number) + "_local\"") !=
+          std::string::npos);
+  }
+  WARN("Wrote S3 TPC-H perf JSON to " << path.string());
+}
+
 TEST_CASE("S3 REST AWS perf benchmark records projected and full scans",
           "[.][s3][bench][aws][live]")
 {
@@ -2282,6 +2536,504 @@ TEST_CASE("transparent read_parquet over S3 keeps REST routing when local Sirius
     require_query_ok(fixture.con, "SELECT count(*) FROM read_parquet(" + sql_quote(uri) + ")");
   REQUIRE(result->RowCount() == 1);
   CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 25);
+}
+
+TEST_CASE("transparent S3 read_parquet expands globbed parquet files",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto const before_stats = sirius::test::get_transparent_execution_stats(fixture.con);
+  auto const s3_scan      = s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const local_scan   = local_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const s3_query     = "SELECT n_nationkey, n_name, n_regionkey FROM " + s3_scan +
+                        " ORDER BY n_nationkey, n_name, n_regionkey";
+  auto const local_query = "SELECT n_nationkey, n_name, n_regionkey FROM " + local_scan +
+                           " ORDER BY n_nationkey, n_name, n_regionkey";
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const after_stats = sirius::test::get_transparent_execution_stats(fixture.con);
+  sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
+}
+
+TEST_CASE("transparent S3 glob opens the literal percent key instead of its slash decoy",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/a%2Fb.parquet", "glob-enc/a/b.parquet"});
+
+  auto const s3_scan    = s3_parquet_glob_scan(*env, "glob-enc/a*.parquet");
+  auto const local_scan = local_parquet_glob_scan(*env, "glob-enc/a*.parquet");
+  auto const s3_query =
+    "SELECT n_nationkey, n_name FROM " + s3_scan + " ORDER BY n_nationkey, n_name";
+  auto const local_query =
+    "SELECT n_nationkey, n_name FROM " + local_scan + " ORDER BY n_nationkey, n_name";
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto result = require_query_ok(fixture.con, "SELECT count(*) FROM " + s3_scan);
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 25);
+}
+
+TEST_CASE("transparent S3 glob opens keys containing URI fragment and query delimiters",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/x#1.parquet", "glob-enc/y?v.parquet"});
+
+  for (auto const pattern :
+       {std::string_view{"glob-enc/x*.parquet"}, std::string_view{"glob-enc/y*.parquet"}}) {
+    DYNAMIC_SECTION("pattern=" << pattern)
+    {
+      auto const s3_query    = "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, pattern);
+      auto const local_query = "SELECT count(*) FROM " + local_parquet_glob_scan(*env, pattern);
+      compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+    }
+  }
+}
+
+TEST_CASE("transparent S3 glob opens a key containing a literal percent byte",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/100%.parquet"});
+
+  auto const s3_query =
+    "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, "glob-enc/100*.parquet");
+  auto const local_query =
+    "SELECT count(*) FROM " + local_parquet_glob_scan(*env, "glob-enc/100*.parquet");
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("transparent S3 glob decodes a percent-encoded Hive value exactly once",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/t/col=a%20b/p0.parquet"});
+
+  auto const options     = std::string_view{", hive_partitioning=true"};
+  auto const s3_scan     = s3_parquet_glob_scan(*env, "glob-enc/t/*/*.parquet", options);
+  auto const local_scan  = local_parquet_glob_scan(*env, "glob-enc/t/*/*.parquet", options);
+  auto const s3_query    = "SELECT col, count(*) FROM " + s3_scan + " GROUP BY col ORDER BY col";
+  auto const local_query = "SELECT col, count(*) FROM " + local_scan + " GROUP BY col ORDER BY col";
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto result = require_query_ok(fixture.con, s3_query);
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).ToString() == "a b");
+  CHECK(result->GetValue(1, 0).GetValue<int64_t>() == 25);
+}
+
+TEST_CASE("S3 direct and glob routes share the literal object cache identity",
+          "[s3][integration][filesystem][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto& manager          = require_sirius_context(fixture).get_scan_manager();
+  auto const direct_uri  = s3_uri(env->bucket, "glob-enc/a%2Fb.parquet");
+  auto direct_datasource = manager.create_datasource(direct_uri);
+  REQUIRE(direct_datasource != nullptr);
+
+  auto glob_files =
+    sirius::io::s3::expand_glob(s3_uri(env->bucket, "glob-enc/a*.parquet"), manager);
+  REQUIRE(glob_files.size() == 1);
+  auto glob_datasource = manager.create_datasource(glob_files.front().path);
+  REQUIRE(glob_datasource != nullptr);
+
+  CHECK(glob_files.front().path == direct_uri);
+  CHECK(glob_datasource->io_object().object_path() == direct_datasource->io_object().object_path());
+  CHECK(glob_datasource->io_object().raw_file_cache_id() ==
+        direct_datasource->io_object().raw_file_cache_id());
+  CHECK(glob_datasource->io_object().size() == direct_datasource->io_object().size());
+}
+
+TEST_CASE("transparent S3 non-glob reads distinguish literal percent keys from spaces",
+          "[s3][integration][sql][gpu_execution][transparent]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto const literal_scan =
+    "read_parquet(" + sql_quote(s3_uri(env->bucket, "glob-enc/f%20g.parquet")) + ")";
+  auto const literal_local = local_parquet_glob_scan(*env, "glob-enc/f%20g.parquet");
+  auto const space_scan =
+    "read_parquet(" + sql_quote(s3_uri(env->bucket, "glob-enc/f g.parquet")) + ")";
+  auto const space_local = local_parquet_glob_scan(*env, "glob-enc/f g.parquet");
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture,
+                                          "SELECT count(*) FROM " + literal_scan + " ORDER BY 1",
+                                          "SELECT count(*) FROM " + literal_local + " ORDER BY 1");
+  compare_transparent_s3_gpu_to_local_cpu(fixture,
+                                          "SELECT count(*) FROM " + space_scan + " ORDER BY 1",
+                                          "SELECT count(*) FROM " + space_local + " ORDER BY 1");
+
+  auto literal_result = require_query_ok(fixture.con, "SELECT count(*) FROM " + literal_scan);
+  auto space_result   = require_query_ok(fixture.con, "SELECT count(*) FROM " + space_scan);
+  CHECK(literal_result->GetValue(0, 0).GetValue<int64_t>() == 25);
+  CHECK(space_result->GetValue(0, 0).GetValue<int64_t>() == 5);
+}
+
+TEST_CASE("transparent S3 glob rejects a literal question mark in a Hive partition segment",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/q/col=a?b/p0.parquet"});
+
+  auto const scan =
+    s3_parquet_glob_scan(*env, "glob-enc/q/col=a?b/*.parquet", ", hive_partitioning=true");
+  CHECK_THROWS_WITH(query_or_throw_on_error(fixture.con, "SELECT count(*) FROM " + scan),
+                    Catch::Contains("literal '?'"));
+}
+
+TEST_CASE("transparent S3 glob rejects a question mark before the Hive partition separator",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/guard-before/co?l=value/p0.parquet"});
+
+  auto const scan =
+    s3_parquet_glob_scan(*env, "glob-enc/guard-before/*/*.parquet", ", hive_partitioning=true");
+  CHECK_THROWS_WITH(query_or_throw_on_error(fixture.con, "SELECT count(n_nationkey) FROM " + scan),
+                    Catch::Contains("literal '?'"));
+}
+
+TEST_CASE("transparent S3 glob permits a question mark in the terminal filename",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/guard-filename/report=foo?bar.parquet"});
+
+  auto const options = std::string_view{", hive_partitioning=true"};
+  auto const s3_scan =
+    s3_parquet_glob_scan(*env, "glob-enc/guard-filename/report*.parquet", options);
+  auto const local_scan =
+    local_parquet_glob_scan(*env, "glob-enc/guard-filename/report*.parquet", options);
+  auto const s3_query    = "SELECT count(n_nationkey) FROM " + s3_scan;
+  auto const local_query = "SELECT count(n_nationkey) FROM " + local_scan;
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto result = require_query_ok(fixture.con, s3_query);
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 25);
+}
+
+TEST_CASE("transparent S3 glob supports an encoded question mark in a Hive partition value",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/q/col=a%3Fb/p0.parquet"});
+
+  auto const options     = std::string_view{", hive_partitioning=true"};
+  auto const s3_scan     = s3_parquet_glob_scan(*env, "glob-enc/q/col=a%3F*/*.parquet", options);
+  auto const local_scan  = local_parquet_glob_scan(*env, "glob-enc/q/col=a%3F*/*.parquet", options);
+  auto const s3_query    = "SELECT col, count(*) FROM " + s3_scan + " GROUP BY col ORDER BY col";
+  auto const local_query = "SELECT col, count(*) FROM " + local_scan + " GROUP BY col ORDER BY col";
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto result = require_query_ok(fixture.con, s3_query);
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).ToString() == "a?b");
+  CHECK(result->GetValue(1, 0).GetValue<int64_t>() == 25);
+}
+
+TEST_CASE("S3 glob results are sorted by raw literal key bytes",
+          "[s3][integration][filesystem][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto& manager = require_sirius_context(fixture).get_scan_manager();
+  auto files    = sirius::io::s3::expand_glob(s3_uri(env->bucket, "glob-enc/*.parquet"), manager);
+
+  std::vector<std::string> actual;
+  actual.reserve(files.size());
+  for (auto const& file : files) {
+    actual.push_back(file.path);
+  }
+  std::vector<std::string> const expected{
+    s3_uri(env->bucket, "glob-enc/100%.parquet"),
+    s3_uri(env->bucket, "glob-enc/a%2Fb.parquet"),
+    s3_uri(env->bucket, "glob-enc/f g.parquet"),
+    s3_uri(env->bucket, "glob-enc/f%20g.parquet"),
+    s3_uri(env->bucket, "glob-enc/x#1.parquet"),
+    s3_uri(env->bucket, "glob-enc/y?v.parquet"),
+  };
+  CHECK(actual == expected);
+}
+
+TEST_CASE("transparent S3 glob ignores percent-encoded keys outside the match",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  require_s3_keys_listed(fixture, *env, {"glob-enc/a%2Fb.parquet", "glob-enc/y?v.parquet"});
+
+  auto const pattern     = std::string_view{"glob-enc/y*.parquet"};
+  auto const s3_query    = "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, pattern);
+  auto const local_query = "SELECT count(*) FROM " + local_parquet_glob_scan(*env, pattern);
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("transparent S3 glob preserves hive partition columns",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto const before_stats = sirius::test::get_transparent_execution_stats(fixture.con);
+  auto const options      = ", hive_partitioning=true";
+  auto const s3_scan      = s3_parquet_glob_scan(*env, "glob/hive/year=*/nation.parquet", options);
+  auto const local_scan = local_parquet_glob_scan(*env, "glob/hive/year=*/nation.parquet", options);
+  auto const s3_query   = "SELECT year, count(*), min(n_nationkey), max(n_nationkey) FROM " +
+                        s3_scan + " GROUP BY year ORDER BY year";
+  auto const local_query = "SELECT year, count(*), min(n_nationkey), max(n_nationkey) FROM " +
+                           local_scan + " GROUP BY year ORDER BY year";
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const after_stats = sirius::test::get_transparent_execution_stats(fixture.con);
+  sirius::test::require_transparent_execution_delta(before_stats, after_stats, 1, 0, 1);
+}
+
+TEST_CASE("transparent S3 glob scans use parquet footer probes",
+          "[s3][integration][sql][gpu_execution][transparent][glob][footerbind]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  sirius_memory_limits limits;
+  limits.rest_perf_instrumentation = true;
+  s3_sql_fixture fixture(*env, limits);
+  set_gpu_execution(fixture.con, true);
+
+  auto& rest = require_rest_ioctx(fixture, s3_uri(env->bucket, "glob/multi/nation_a.parquet"));
+  auto const s3_scan     = s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const local_scan  = local_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const s3_query    = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + s3_scan;
+  auto const local_query = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + local_scan;
+
+  auto const before = rest.perf_snapshot();
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const delta = delta_snapshot(rest.perf_snapshot(), before);
+
+  CHECK(delta.blocking_host_get_count == 0);
+}
+
+TEST_CASE("transparent S3 glob remains correct with a straddled footer-probe window",
+          "[s3][integration][sql][gpu_execution][transparent][glob][footerbind]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  sirius_memory_limits limits;
+  limits.rest_footer_probe_bytes = "512 B";
+  s3_sql_fixture fixture(*env, limits);
+  set_gpu_execution(fixture.con, true);
+
+  auto const s3_scan     = s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const local_scan  = local_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const s3_query    = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + s3_scan;
+  auto const local_query = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + local_scan;
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+}
+
+TEST_CASE("transparent S3 glob warm scan skips blocking host reads",
+          "[s3][integration][sql][gpu_execution][transparent][glob][footerbind]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  sirius_memory_limits limits;
+  limits.rest_perf_instrumentation = true;
+  s3_sql_fixture fixture(*env, limits);
+  set_gpu_execution(fixture.con, true);
+
+  auto& rest = require_rest_ioctx(fixture, s3_uri(env->bucket, "glob/multi/nation_a.parquet"));
+  auto const s3_scan     = s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const local_scan  = local_parquet_glob_scan(*env, "glob/multi/nation_*.parquet");
+  auto const s3_query    = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + s3_scan;
+  auto const local_query = "SELECT count(n_nationkey), min(n_name), max(n_name) FROM " + local_scan;
+
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const before_warm = rest.perf_snapshot();
+  compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  auto const warm_delta = delta_snapshot(rest.perf_snapshot(), before_warm);
+
+  CHECK(warm_delta.blocking_host_get_count == 0);
+}
+
+TEST_CASE("transparent S3 glob matcher semantics match DuckDB segment globs",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto check_count = [&](std::string_view s3_pattern,
+                         std::string_view local_pattern,
+                         std::int64_t expected) {
+    auto const s3_query    = "SELECT count(*) FROM " + s3_parquet_glob_scan(*env, s3_pattern);
+    auto const local_query = "SELECT count(*) FROM " + local_parquet_glob_scan(*env, local_pattern);
+    compare_transparent_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+    auto result = require_query_ok(fixture.con, s3_query);
+    REQUIRE(result->RowCount() == 1);
+    CHECK(result->GetValue(0, 0).GetValue<int64_t>() == expected);
+  };
+
+  check_count("glob/multi/nation_?.parquet", "glob/multi/nation_?.parquet", 50);
+  check_count("glob/multi/nation_[ab].parquet", "glob/multi/nation_[ab].parquet", 50);
+  check_count("glob/hive/**/nation.parquet", "glob/hive/**/nation.parquet", 50);
+  check_count("root_*.parquet", "root_*.parquet", 50);
+
+  auto uppercase_root_uri = s3_uri(env->bucket, "root_*.parquet");
+  uppercase_root_uri.replace(0, 2, "S3");
+  auto const uppercase_root_query =
+    "SELECT count(n_nationkey) FROM read_parquet(" + sql_quote(uppercase_root_uri) + ")";
+  auto const local_root_query =
+    "SELECT count(n_nationkey) FROM " + local_parquet_glob_scan(*env, "root_*.parquet");
+  compare_transparent_s3_gpu_to_local_cpu(fixture, uppercase_root_query, local_root_query);
+  auto uppercase_root = require_query_ok(fixture.con, uppercase_root_query);
+  REQUIRE(uppercase_root->RowCount() == 1);
+  CHECK(uppercase_root->GetValue(0, 0).GetValue<int64_t>() == 50);
+
+  auto wildcard_bucket =
+    fixture.con.Query("SELECT count(*) FROM read_parquet('s3://*/glob/multi/nation_*.parquet')");
+  REQUIRE(wildcard_bucket);
+  REQUIRE(wildcard_bucket->HasError());
+  INFO(wildcard_bucket->GetError());
+  CHECK(wildcard_bucket->GetError().find("bucket") != std::string::npos);
+}
+
+TEST_CASE("transparent S3 glob scans 1001 parquet objects across LIST pages",
+          "[.][s3][integration][sql][gpu_execution][transparent][glob][large][glob-scale]")
+{
+  if (!truthy_env("SIRIUS_TEST_S3_GLOB_SCALE")) {
+    SUCCEED("SIRIUS_TEST_S3_GLOB_SCALE is not enabled");
+    return;
+  }
+
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+
+  auto const query =
+    "SELECT count(n_nationkey), sum(n_nationkey), min(n_nationkey), max(n_nationkey) FROM " +
+    s3_parquet_glob_scan(*env, "glob-scale/part_*.parquet");
+  auto result = require_query_ok(fixture.con, query);
+
+  REQUIRE(result->RowCount() == 1);
+  CHECK(result->GetValue(0, 0).GetValue<int64_t>() == 25'025);
+  CHECK(result->GetValue(1, 0).GetValue<int64_t>() == 300'300);
+  CHECK(result->GetValue(2, 0).GetValue<int64_t>() == 0);
+  CHECK(result->GetValue(3, 0).GetValue<int64_t>() == 24);
+}
+
+TEST_CASE("transparent S3 glob reports no-files and GPU-only errors clearly",
+          "[s3][integration][sql][gpu_execution][transparent][glob]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  SECTION("zero-match glob reports a no-files class error")
+  {
+    s3_sql_fixture fixture(*env);
+    set_gpu_execution(fixture.con, true);
+
+    auto result = fixture.con.Query("SELECT count(*) FROM " +
+                                    s3_parquet_glob_scan(*env, "glob/multi/no-match-*.parquet"));
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK(
+      (error.find("No files") != std::string::npos || error.find("no files") != std::string::npos));
+    CHECK(error.find("glob/wildcard patterns are not supported") == std::string::npos);
+    CHECK(error.find("No filesystem") == std::string::npos);
+    CHECK(error.find("no filesystem") == std::string::npos);
+  }
+
+  SECTION("gpu_execution=false rejects globbed S3 at the filesystem gate")
+  {
+    s3_sql_fixture fixture(*env);
+    set_gpu_execution(fixture.con, false);
+
+    auto result = fixture.con.Query("SELECT count(*) FROM " +
+                                    s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet"));
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK(error.find("S3 is GPU-only") != std::string::npos);
+    CHECK(error.find("SET gpu_execution=true") != std::string::npos);
+  }
+
+  SECTION("configured glob match cap rejects overly broad matches")
+  {
+    sirius_memory_limits limits;
+    limits.rest_list_max_matches = 1;
+    s3_sql_fixture fixture(*env, limits);
+    set_gpu_execution(fixture.con, true);
+
+    auto result = fixture.con.Query("SELECT count(n_nationkey) FROM " +
+                                    s3_parquet_glob_scan(*env, "glob/multi/nation_*.parquet"));
+    REQUIRE(result);
+    REQUIRE(result->HasError());
+    auto const error = result->GetError();
+    INFO(error);
+    CHECK(error.find("narrow the glob prefix") != std::string::npos);
+  }
 }
 
 TEST_CASE("gpu_execution S3 SQL surface returns empty result sets cleanly",
@@ -2787,6 +3539,255 @@ TEST_CASE("gpu_execution S3 SQL surface matches local TPC-H Q3 shape",
                               {1});
 }
 
+TEST_CASE("S3 read_parquet op shape T1 matches outer join semantics",
+          "[s3][integration][sql][t1-outer-join]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto const s3_region      = s3_parquet_scan(*env, "region");
+  auto const s3_nation      = s3_parquet_scan(*env, "nation");
+  auto const s3_supplier    = s3_parquet_scan(*env, "supplier");
+  auto const local_region   = local_parquet_scan(*env, "region");
+  auto const local_nation   = local_parquet_scan(*env, "nation");
+  auto const local_supplier = local_parquet_scan(*env, "supplier");
+
+  compare_s3_gpu_to_local_cpu(
+    fixture,
+    "SELECT r.r_regionkey, n.n_nationkey FROM " + s3_region + " r LEFT JOIN " + s3_nation +
+      " n ON n.n_regionkey = r.r_regionkey AND n.n_nationkey > 100 "
+      "ORDER BY r.r_regionkey, n.n_nationkey",
+    "SELECT r.r_regionkey, n.n_nationkey FROM " + local_region + " r LEFT JOIN " + local_nation +
+      " n ON n.n_regionkey = r.r_regionkey AND n.n_nationkey > 100 "
+      "ORDER BY r.r_regionkey, n.n_nationkey");
+
+  compare_s3_gpu_to_local_cpu(
+    fixture,
+    "SELECT r.r_regionkey, n.n_nationkey FROM " + s3_nation + " n RIGHT JOIN " + s3_region +
+      " r ON n.n_regionkey = r.r_regionkey AND n.n_nationkey > 100 "
+      "ORDER BY r.r_regionkey, n.n_nationkey",
+    "SELECT r.r_regionkey, n.n_nationkey FROM " + local_nation + " n RIGHT JOIN " + local_region +
+      " r ON n.n_regionkey = r.r_regionkey AND n.n_nationkey > 100 "
+      "ORDER BY r.r_regionkey, n.n_nationkey");
+
+  compare_s3_gpu_to_local_cpu(fixture,
+                              "SELECT n.n_nationkey, count(s.s_suppkey) AS supplier_count FROM " +
+                                s3_nation + " n LEFT JOIN " + s3_supplier +
+                                " s ON s.s_nationkey = n.n_nationkey "
+                                "GROUP BY n.n_nationkey ORDER BY n.n_nationkey",
+                              "SELECT n.n_nationkey, count(s.s_suppkey) AS supplier_count FROM " +
+                                local_nation + " n LEFT JOIN " + local_supplier +
+                                " s ON s.s_nationkey = n.n_nationkey "
+                                "GROUP BY n.n_nationkey ORDER BY n.n_nationkey");
+}
+
+TEST_CASE("S3 read_parquet op shape T2 matches grouped distinct aggregates",
+          "[s3][integration][sql][t2-groupby]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  auto const grouped_query = [](std::string const& scan) {
+    return "SELECT l_returnflag, l_linestatus, count(*) AS item_count, "
+           "count(DISTINCT l_orderkey) AS distinct_orders, sum(l_quantity) AS quantity "
+           "FROM " +
+           scan +
+           " GROUP BY l_returnflag, l_linestatus HAVING count(*) > 100 "
+           "ORDER BY l_returnflag, l_linestatus";
+  };
+
+  s3_sql_fixture fixture(*env);
+  compare_s3_gpu_to_local_cpu(fixture,
+                              grouped_query(s3_parquet_scan(*env, "lineitem")),
+                              grouped_query(local_parquet_scan(*env, "lineitem")),
+                              {4});
+}
+
+TEST_CASE("S3 read_parquet op shape T3 matches string predicates",
+          "[s3][integration][sql][t3-string]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  auto const s3_part      = s3_parquet_scan(*env, "part");
+  auto const s3_nation    = s3_parquet_scan(*env, "nation");
+  auto const local_part   = local_parquet_scan(*env, "part");
+  auto const local_nation = local_parquet_scan(*env, "nation");
+
+  compare_s3_gpu_to_local_cpu(fixture,
+                              "SELECT count(*) AS green_count FROM " + s3_part +
+                                " WHERE p_name LIKE '%green%' ORDER BY green_count",
+                              "SELECT count(*) AS green_count FROM " + local_part +
+                                " WHERE p_name LIKE '%green%' ORDER BY green_count");
+
+  compare_s3_gpu_to_local_cpu(fixture,
+                              "SELECT p_partkey, p_name FROM " + s3_part +
+                                " WHERE p_name LIKE 'forest%' ORDER BY p_partkey LIMIT 100",
+                              "SELECT p_partkey, p_name FROM " + local_part +
+                                " WHERE p_name LIKE 'forest%' ORDER BY p_partkey LIMIT 100");
+
+  compare_s3_gpu_to_local_cpu(
+    fixture,
+    "SELECT n_nationkey, n_name FROM " + s3_nation +
+      " WHERE n_name IN ('FRANCE', 'GERMANY', 'BRAZIL') ORDER BY n_nationkey",
+    "SELECT n_nationkey, n_name FROM " + local_nation +
+      " WHERE n_name IN ('FRANCE', 'GERMANY', 'BRAZIL') ORDER BY n_nationkey");
+}
+
+TEST_CASE("S3 read_parquet op shape T4 mixes local and S3 scans",
+          "[s3][integration][sql][t4-mixed]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  auto const local_nation   = local_parquet_scan(*env, "nation");
+  auto const local_supplier = local_parquet_scan(*env, "supplier");
+  auto const s3_supplier    = s3_parquet_scan(*env, "supplier");
+
+  s3_sql_fixture fixture(*env);
+  compare_s3_gpu_to_local_cpu(
+    fixture,
+    "SELECT n.n_name, s.s_name FROM " + local_nation + " n JOIN " + s3_supplier +
+      " s ON s.s_nationkey = n.n_nationkey "
+      "WHERE n.n_regionkey = 1 ORDER BY s.s_suppkey LIMIT 50",
+    "SELECT n.n_name, s.s_name FROM " + local_nation + " n JOIN " + local_supplier +
+      " s ON s.s_nationkey = n.n_nationkey "
+      "WHERE n.n_regionkey = 1 ORDER BY s.s_suppkey LIMIT 50");
+}
+
+TEST_CASE("S3 read_parquet op shape T5 preserves null decimal and timestamp values",
+          "[s3][integration][sql][t5-edge-types]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  auto const edge_query = [](std::string const& scan) {
+    return "SELECT id, n, d, ts FROM " + scan +
+           " WHERE n IS NULL OR d < CAST(0 AS DECIMAL(18,4)) ORDER BY id";
+  };
+  auto const aggregate_query = [](std::string const& scan) {
+    return "SELECT count(*) AS total, count(n) AS non_null_n, sum(d) AS sum_d, "
+           "min(ts) AS min_ts, max(ts) AS max_ts FROM " +
+           scan + " ORDER BY total, non_null_n, sum_d, min_ts, max_ts";
+  };
+
+  s3_sql_fixture fixture(*env);
+  compare_s3_gpu_to_local_cpu(fixture,
+                              edge_query(s3_parquet_scan(*env, "edge_types")),
+                              edge_query(local_parquet_scan(*env, "edge_types")),
+                              {2});
+  compare_s3_gpu_to_local_cpu(fixture,
+                              aggregate_query(s3_parquet_scan(*env, "edge_types")),
+                              aggregate_query(local_parquet_scan(*env, "edge_types")),
+                              {2});
+}
+
+TEST_CASE("S3 read_parquet op shape T6 matches CTE and scalar subquery results",
+          "[s3][integration][sql][t6-cte]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  auto const cte_query = [](std::string const& lineitem_scan, std::string const& orders_scan) {
+    return "WITH revenue AS ("
+           "SELECT l_orderkey, sum(l_extendedprice * (1 - l_discount)) AS revenue "
+           "FROM " +
+           lineitem_scan +
+           " GROUP BY l_orderkey) "
+           "SELECT o.o_orderkey, revenue.revenue FROM " +
+           orders_scan +
+           " o JOIN revenue ON revenue.l_orderkey = o.o_orderkey "
+           "WHERE o.o_orderstatus = 'O' "
+           "ORDER BY revenue.revenue DESC, o.o_orderkey LIMIT 200";
+  };
+  auto const scalar_query = [](std::string const& orders_scan) {
+    return "SELECT o_orderkey FROM " + orders_scan +
+           " WHERE o_totalprice > (SELECT avg(o_totalprice) FROM " + orders_scan +
+           ") ORDER BY o_orderkey LIMIT 100";
+  };
+
+  auto fixture = std::make_shared<s3_sql_fixture>(*env);
+  compare_s3_gpu_to_local_cpu_with_watchdog(
+    fixture,
+    "T6 CTE aggregate join",
+    cte_query(s3_parquet_scan(*env, "lineitem"), s3_parquet_scan(*env, "orders")),
+    cte_query(local_parquet_scan(*env, "lineitem"), local_parquet_scan(*env, "orders")),
+    std::chrono::seconds{120},
+    {1});
+  compare_s3_gpu_to_local_cpu_with_watchdog(fixture,
+                                            "T6 scalar subquery",
+                                            scalar_query(s3_parquet_scan(*env, "orders")),
+                                            scalar_query(local_parquet_scan(*env, "orders")),
+                                            std::chrono::seconds{120});
+}
+
+TEST_CASE("gpu_execution S3 nested parquet projections match local DuckDB CPU",
+          "[.][s3][integration][sql][gpu_execution][nested]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  struct nested_projection_case {
+    std::string_view table;
+    std::string_view select_list;
+  };
+
+  constexpr std::array<nested_projection_case, 5> cases{{
+    {"nested_struct", "id, payload"},
+    {"nested_list", "id, items"},
+    {"nested_map", "id, attrs"},
+    {"nested_deep", "id, struct_of_list, list_of_struct, tail"},
+    {"nested_chunk_boundary", "id, items, payload, attrs, tail"},
+  }};
+
+  s3_sql_fixture fixture(*env);
+  for (auto const& test_case : cases) {
+    auto const s3_query = "SELECT " + std::string{test_case.select_list} + " FROM " +
+                          s3_parquet_scan(*env, test_case.table) + " ORDER BY id";
+    auto const local_query = "SELECT " + std::string{test_case.select_list} + " FROM " +
+                             local_parquet_scan(*env, test_case.table) + " ORDER BY id";
+
+    INFO("table=" << test_case.table);
+    compare_s3_gpu_to_local_cpu(fixture, s3_query, local_query);
+  }
+}
+
+TEST_CASE("gpu_execution rejects operations on nested S3 parquet columns cleanly",
+          "[.][s3][integration][sql][gpu_execution][nested][unsupported]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+
+  auto const struct_scan = s3_parquet_scan(*env, "nested_struct");
+  require_nested_operation_unsupported(
+    fixture, "SELECT id FROM " + struct_scan + " WHERE payload IS NULL", "payload");
+
+  require_nested_operation_unsupported(
+    fixture,
+    "SELECT id FROM " + struct_scan + " WHERE payload = struct_pack(a := 10, b := 'alpha')",
+    "payload");
+
+  auto const list_scan = s3_parquet_scan(*env, "nested_list");
+  require_nested_operation_unsupported(
+    fixture, "SELECT id FROM " + list_scan + " WHERE items IS NULL", "items");
+
+  require_nested_operation_unsupported(
+    fixture, "SELECT items, count(*) FROM " + list_scan + " GROUP BY items", "items");
+
+  require_nested_operation_unsupported(
+    fixture,
+    "SELECT l.id FROM " + list_scan + " l JOIN " + list_scan + " r ON l.items = r.items",
+    "items");
+
+  auto const map_scan = s3_parquet_scan(*env, "nested_map");
+  require_nested_operation_unsupported(
+    fixture, "SELECT id FROM " + map_scan + " WHERE attrs IS NULL", "attrs");
+}
+
 TEST_CASE("transparent S3 window query reports unsupported S3 CPU fallback",
           "[s3][integration][sql][gpu_execution][fallback][transparent]")
 {
@@ -2807,6 +3808,29 @@ TEST_CASE("transparent S3 window query reports unsupported S3 CPU fallback",
          error.find("WINDOW") != std::string::npos));
   CHECK(error.find("No filesystem") == std::string::npos);
   CHECK(error.find("no filesystem") == std::string::npos);
+}
+
+TEST_CASE("transparent S3 projection fallback reports prose instead of an exception envelope",
+          "[s3][integration][sql][gpu_execution][fallback][transparent]")
+{
+  auto env = load_s3_test_env();
+  if (should_skip_s3_env(env)) { return; }
+
+  s3_sql_fixture fixture(*env);
+  set_gpu_execution(fixture.con, true);
+  auto const query =
+    "SELECT abs(n_nationkey - 100) FROM " + s3_parquet_scan(*env, "nation") + " LIMIT 1";
+  auto result = fixture.con.Query(query);
+  REQUIRE(result);
+  REQUIRE(result->HasError());
+
+  auto const error = result->GetError();
+  INFO(error);
+  CHECK(error.find("S3 CPU fallback is not supported") != std::string::npos);
+  CHECK(error.find("Underlying GPU error: Unsupported expression in projection") !=
+        std::string::npos);
+  CHECK(error.find("\"exception_type\"") == std::string::npos);
+  CHECK(error.find("\"exception_message\"") == std::string::npos);
 }
 
 TEST_CASE("transparent S3 view fallback is rejected instead of replaying on CPU",
@@ -3134,9 +4158,12 @@ TEST_CASE("gpu_execution large S3 lineitem join uses planner cardinality and mat
     large_lineitem_orders_join_query(local_parquet_file_scan(large->local_path),
                                      local_parquet_scan(*env, "orders")));
 
-  auto const explain_sql = large_lineitem_orders_join_query(s3_sirius_large_lineitem_scan(*env),
-                                                            s3_sirius_parquet_scan(*env, "orders"));
-  auto const plan        = explain_text(fixture.con, explain_sql);
+  // Keep this plan unfiltered. The filtered query above checks correctness;
+  // filter pushdown makes EXPLAIN report a post-filter estimate.
+  auto const explain_sql = "SELECT count(*) FROM " + s3_sirius_large_lineitem_scan(*env) +
+                           " l JOIN " + s3_sirius_parquet_scan(*env, "orders") +
+                           " o ON l.l_orderkey = o.o_orderkey";
+  auto const plan = explain_text(fixture.con, explain_sql);
   INFO(plan);
   CHECK(plan_mentions_cardinality(plan, expected_lineitem_rows));
   CHECK(plan_mentions_cardinality(plan, expected_orders_rows));

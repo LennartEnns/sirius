@@ -23,6 +23,7 @@
 #include "op/scan/gpu_ingestible_types.hpp"
 #include "op/scan/sirius_gpu_scan_operator.hpp"
 #include "scan_manager/balancing_strategy.hpp"
+#include "scan_manager/mvcc_chunk_mask.hpp"
 #include "scan_manager/split_connector.hpp"
 
 #include <cudf/io/text/byte_range_info.hpp>
@@ -36,8 +37,26 @@
 namespace sirius::scan_manager {
 
 struct databatch_provider {
-  virtual ~databatch_provider()                                   = default;
-  virtual std::shared_ptr<cucascade::data_batch> get_next_batch() = 0;
+  /// One cached chunk or one insert-delta split, plus its (optional)
+  /// per-query MVCC keep-mask. A batch carries either @ref data (resident
+  /// cached chunk) or @ref scan_info (delta split, yielded after the
+  /// resident chunks); both null means end-of-stream.
+  struct batch {
+    std::shared_ptr<cucascade::data_batch> data;
+    mvcc_chunk_mask mvcc_keep_mask;  ///< default = all rows visible
+    /// True when scan normalization will cast at least one selected column of this cached chunk:
+    /// its recorded carrier differs from the carrier the scan plans for that column.
+    bool needs_carrier_conversion{false};
+    /// Exact bytes of the destination columns (data plus validity mask) those casts allocate.
+    /// Zero when nothing converts or when a converting chunk's row count is unreadable; the scan
+    /// memory estimate then falls back to its conservative maximum-expansion bound.
+    std::size_t conversion_destination_bytes{0};
+    std::unique_ptr<op::scan::scan_info> scan_info;
+    int preferred_device{-1};  ///< placement for scan_info splits (-1 = none)
+  };
+
+  virtual ~databatch_provider()  = default;
+  virtual batch get_next_batch() = 0;
 };
 
 /**
@@ -102,6 +121,10 @@ class load_balancing_scan_batch_coalescer {
     std::shared_ptr<balancing_strategy> balancer;
     std::shared_ptr<split_connector> connector;
     std::unique_ptr<databatch_provider> batch_provider;
+    /// Whether the op's ingestible applies a row-filter expression to cached
+    /// batches; stamped onto each drained split so its working-set estimate
+    /// covers the filter-by-copy peak.
+    bool row_filter_pending{false};
   };
 
   load_balancing_scan_batch_coalescer()                                           = default;
@@ -124,16 +147,17 @@ class load_balancing_scan_batch_coalescer {
 
   /// Drain @p provider into @p connector: pull batches until the provider is
   /// exhausted (or @p stop fires), wrapping each as a resident
-  /// scan_operator_input. Always closes the connector on exit — with the
-  /// pending exception when the provider throws, so the consumer's
-  /// get_next_split() rethrows a clean query error instead of blocking
-  /// forever (the dispatcher swallows task exceptions, so an unclosed
-  /// connector is a silent query hang). Static and public so the drain
-  /// behavior is unit-testable against a fake provider; production use is
-  /// the sequencer's cached-slot path.
+  /// scan_operator_input with @p row_filter_pending stamped on. Always closes
+  /// the connector on exit — with the pending exception when the provider
+  /// throws, so the consumer's get_next_split() rethrows a clean query error
+  /// instead of blocking forever (the dispatcher swallows task exceptions, so
+  /// an unclosed connector is a silent query hang). Static and public so the
+  /// drain behavior is unit-testable against a fake provider; production use
+  /// is the sequencer's cached-slot path.
   static void drain_cached_provider(databatch_provider& provider,
                                     split_connector& connector,
-                                    std::stop_token const& stop);
+                                    std::stop_token const& stop,
+                                    bool row_filter_pending);
 
   /// Spawn the sequencer task on @p dispatcher.  The dispatcher must
   /// expose @c enqueue(callable) and inject a @c std::stop_token when

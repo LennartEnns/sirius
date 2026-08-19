@@ -56,10 +56,6 @@ sirius_physical_column_data_scan::sirius_physical_column_data_scan(
 void sirius_physical_column_data_scan::build_pipelines(
   pipeline::sirius_pipeline& current, pipeline::sirius_meta_pipeline& meta_pipeline)
 {
-  // Cached chunk scan of a LEFT_DELIM_JOIN: the delim join's sink executes it inline, so
-  // it contributes no pipeline; compute_repository_wiring emits its wiring.
-  if (_owned_by_delim_join) { return; }
-
   // check if there is any additional action we need to do depending on the type
   auto& state = meta_pipeline.get_state();
   switch (type) {
@@ -106,10 +102,6 @@ void sirius_physical_column_data_scan::build_pipelines(
     case SiriusPhysicalOperatorType::RECURSIVE_RECURRING_CTE_SCAN:
     case SiriusPhysicalOperatorType::RECURSIVE_CTE_SCAN:
       throw not_implemented_exception("Recursive CTE scan not implemented for GPU");
-      if (!meta_pipeline.has_recursive_cte()) {
-        throw internal_exception("Recursive CTE scan found without recursive CTE node");
-      }
-      break;
     default: break;
   }
   D_ASSERT(children.empty());
