@@ -616,16 +616,6 @@ SiriusContext::StandaloneQueryScope::~StandaloneQueryScope() noexcept
   state_ = scope_state::FAILED;
 }
 
-void SiriusContext::OnBeforeExtensionLoad(ClientContext& /*context*/)
-{
-  enter_internal_query();
-}
-
-void SiriusContext::OnAfterExtensionLoad(ClientContext& /*context*/)
-{
-  exit_internal_query();
-}
-
 void SiriusContext::initialize(const sirius::sirius_config& config)
 {
   if (is_initialized_) { throw std::runtime_error("Sirius context is already initialized."); }

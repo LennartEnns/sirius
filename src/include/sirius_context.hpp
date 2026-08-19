@@ -277,11 +277,6 @@ class SiriusContext : public ClientContextState {
   /// \param error Optional error data.
   void QueryEnd(ClientContext& context, optional_ptr<ErrorData> error) final;
 
-  /// \brief Enter internal-query suppression before loading an extension.
-  void OnBeforeExtensionLoad(ClientContext& context) final;
-  /// \brief Exit internal-query suppression after loading an extension.
-  void OnAfterExtensionLoad(ClientContext& context) final;
-
   /// \brief Must return true for OnFinalizePrepare to be called by DuckDB.
   bool CanRequestRebind() final { return true; }
 
