@@ -1,0 +1,771 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index f1b032b4..d354f72c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -453,6 +453,7 @@ set(EXTENSION_SOURCES
+ 
+ # Deleting src/legacy/ cleanly removes legacy build support.
+ set(CUDA_SOURCES
++    src/op/aggregate/pack_group_keys.cu
+     src/op/partition/crc32_partition_hash.cu
+     src/cuda/dense_count_join_impl.cu
+     src/cuda/dynamic_filter_replica_transfer.cu
+diff --git a/src/include/op/aggregate/aggregate_op_util.hpp b/src/include/op/aggregate/aggregate_op_util.hpp
+index b25832b8..f28b7994 100644
+--- a/src/include/op/aggregate/aggregate_op_util.hpp
++++ b/src/include/op/aggregate/aggregate_op_util.hpp
+@@ -93,5 +93,29 @@ CudfAggregateDefinitions convert_duckdb_aggregates_to_cudf(
+   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& groups_p,
+   const duckdb::vector<std::unique_ptr<sirius::ast::node>>& expressions);
+ 
++/**
++ * @brief Per-column packing metadata for group_key_pack_plan.
++ */
++struct group_key_col_meta {
++  int64_t min_val;  ///< Minimum value of the column (subtracted before packing)
++  int32_t shift;    ///< Left-shift applied to (val - min_val) within the packed INT32
++  int32_t bits;     ///< Number of bits allocated to this column in the packed INT32
++};
++
++/**
++ * @brief Plan to bit-pack multiple integer group-by key columns into a single INT32.
++ *
++ * Created at plan time from DuckDB column statistics. Each key column contributes `bits` bits
++ * to the packed value via `(val - min_val) << shift`. The packed INT32 is passed to cuDF
++ * groupby as a single non-nullable fixed-width key (radix-sort path). After groupby, each
++ * original key column is recovered via shift + mask + add.
++ *
++ * Only created when all group key columns are integer types and total_bits <= 32.
++ */
++struct group_key_pack_plan {
++  std::vector<group_key_col_meta> cols;  ///< One entry per group key column, in group_idx order
++  int32_t total_bits{0};                 ///< Sum of all col.bits; always <= 32
++};
++
+ }  // namespace op
+ }  // namespace sirius
+diff --git a/src/include/op/aggregate/gpu_aggregate_impl.hpp b/src/include/op/aggregate/gpu_aggregate_impl.hpp
+index dcb503ce..8ddb59b2 100644
+--- a/src/include/op/aggregate/gpu_aggregate_impl.hpp
++++ b/src/include/op/aggregate/gpu_aggregate_impl.hpp
+@@ -16,6 +16,7 @@
+ 
+ #pragma once
+ 
++#include "op/aggregate/aggregate_op_util.hpp"
+ #include "telemetry/data_batch_probe.hpp"
+ 
+ #include <cudf/cudf_utils.hpp>
+@@ -88,6 +89,7 @@ class gpu_aggregate_impl {
+     const std::vector<cudf::aggregation::Kind>& aggregates,
+     const std::vector<int>& aggregate_idx,
+     const std::vector<std::vector<int>>& aggregate_struct_col_indices,
++    std::optional<group_key_pack_plan> const& key_pack_plan,
+     rmm::cuda_stream_view stream,
+     cucascade::memory::memory_space& memory_space,
+     const telemetry::batch_telemetry_info& telemetry_info = {});
+diff --git a/src/include/op/sirius_physical_grouped_aggregate.hpp b/src/include/op/sirius_physical_grouped_aggregate.hpp
+index fb463614..ae3b751e 100644
+--- a/src/include/op/sirius_physical_grouped_aggregate.hpp
++++ b/src/include/op/sirius_physical_grouped_aggregate.hpp
+@@ -31,6 +31,7 @@
+ 
+ #include <memory>
+ #include <numeric>
++#include <optional>
+ 
+ namespace sirius {
+ namespace op {
+@@ -86,6 +87,10 @@ class sirius_physical_grouped_aggregate : public sirius_physical_operator {
+   bool has_avg            = false;
+   bool has_count_distinct = false;
+ 
++  // Set at plan time when all group keys are integer types with stats and total bits <= 32.
++  // Enables the bit-packed single-INT32 groupby path in local_grouped_aggregate.
++  std::optional<group_key_pack_plan> key_pack_plan;
++
+  public:
+   std::vector<int> get_output_grouping_indices() const
+   {
+diff --git a/src/op/aggregate/gpu_aggregate_impl.cpp b/src/op/aggregate/gpu_aggregate_impl.cpp
+index 4c07991b..4503ddeb 100644
+--- a/src/op/aggregate/gpu_aggregate_impl.cpp
++++ b/src/op/aggregate/gpu_aggregate_impl.cpp
+@@ -19,6 +19,10 @@
+ #include "data/data_batch_utils.hpp"
+ #include "log/logging.hpp"
+ #include "op/aggregate/group_key_labels.hpp"
++#include "op/aggregate/pack_group_keys.hpp"
++
++#include <cudf/reduction.hpp>
++#include <cudf/scalar/scalar.hpp>
+ 
+ #include <cudf/column/column_factories.hpp>
+ #include <cudf/copying.hpp>
+@@ -38,6 +42,98 @@
+ namespace sirius {
+ namespace op {
+ 
++namespace {
++
++// Extract an int64 value from a scalar of any integer type (host-side read after stream sync).
++static int64_t scalar_as_int64(cudf::scalar const& s, rmm::cuda_stream_view stream)
++{
++  switch (s.type().id()) {
++    case cudf::type_id::INT8:
++      return static_cast<int64_t>(static_cast<cudf::numeric_scalar<int8_t> const&>(s).value(stream));
++    case cudf::type_id::INT16:
++      return static_cast<int64_t>(static_cast<cudf::numeric_scalar<int16_t> const&>(s).value(stream));
++    case cudf::type_id::INT32:
++      return static_cast<int64_t>(static_cast<cudf::numeric_scalar<int32_t> const&>(s).value(stream));
++    case cudf::type_id::INT64:
++      return static_cast<cudf::numeric_scalar<int64_t> const&>(s).value(stream);
++    case cudf::type_id::UINT8:
++      return static_cast<int64_t>(static_cast<cudf::numeric_scalar<uint8_t> const&>(s).value(stream));
++    case cudf::type_id::UINT16:
++      return static_cast<int64_t>(static_cast<cudf::numeric_scalar<uint16_t> const&>(s).value(stream));
++    case cudf::type_id::UINT32:
++      return static_cast<int64_t>(static_cast<cudf::numeric_scalar<uint32_t> const&>(s).value(stream));
++    case cudf::type_id::UINT64: {
++      auto v = static_cast<cudf::numeric_scalar<uint64_t> const&>(s).value(stream);
++      return static_cast<int64_t>(v);  // safe because range <= UINT32_MAX (checked by caller)
++    }
++    default: throw std::runtime_error("scalar_as_int64: unsupported scalar type");
++  }
++}
++
++// Build a pack plan from actual column data when plan-time stats are unavailable.
++// Launches cudf::minmax() per group key column. Skips if any column is non-integer or if
++// total bits exceed 32.
++static std::optional<group_key_pack_plan> try_runtime_pack_plan(
++  cudf::table_view const& input,
++  std::vector<int> const& group_idx,
++  rmm::cuda_stream_view stream,
++  rmm::device_async_resource_ref mr)
++{
++  group_key_pack_plan plan;
++  int32_t total_bits = 0;
++  plan.cols.reserve(group_idx.size());
++
++  for (int idx : group_idx) {
++    auto const col = input.column(idx);
++    auto const tid = col.type().id();
++
++    switch (tid) {
++      case cudf::type_id::INT8:
++      case cudf::type_id::INT16:
++      case cudf::type_id::INT32:
++      case cudf::type_id::INT64:
++      case cudf::type_id::UINT8:
++      case cudf::type_id::UINT16:
++      case cudf::type_id::UINT32:
++      case cudf::type_id::UINT64: break;
++      default: return std::nullopt;
++    }
++
++    auto [min_s, max_s] = cudf::minmax(col, stream, mr);
++    if (!min_s->is_valid(stream) || !max_s->is_valid(stream)) { return std::nullopt; }
++
++    int64_t const min_val = scalar_as_int64(*min_s, stream);
++    int64_t const max_val = scalar_as_int64(*max_s, stream);
++    if (max_val < min_val) { return std::nullopt; }
++
++    uint64_t const range = static_cast<uint64_t>(max_val - min_val);
++    if (range > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
++      return std::nullopt;
++    }
++
++    int32_t bits   = 0;
++    uint32_t r_tmp = static_cast<uint32_t>(range);
++    while (r_tmp > 0) {
++      r_tmp >>= 1;
++      bits++;
++    }
++
++    total_bits += bits;
++    if (total_bits > 32) { return std::nullopt; }
++
++    group_key_col_meta meta;
++    meta.min_val = min_val;
++    meta.shift   = total_bits - bits;
++    meta.bits    = bits;
++    plan.cols.push_back(meta);
++  }
++
++  plan.total_bits = total_bits;
++  return plan;
++}
++
++}  // namespace
++
+ template <typename Base = cudf::aggregation>
+ std::unique_ptr<Base> get_local_aggregation(cudf::aggregation::Kind kind)
+ {
+@@ -126,6 +222,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
+   const std::vector<cudf::aggregation::Kind>& aggregates,
+   const std::vector<int>& aggregate_idx,
+   const std::vector<std::vector<int>>& aggregate_struct_col_indices,
++  std::optional<group_key_pack_plan> const& key_pack_plan,
+   rmm::cuda_stream_view stream,
+   cucascade::memory::memory_space& memory_space,
+   const telemetry::batch_telemetry_info& telemetry_info)
+@@ -227,11 +324,51 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
+   // expensive HLL-based NDV estimate.
+   constexpr double dict_encode_min_avg_len = 8.0;
+   constexpr double dict_encode_max_ratio   = 0.10;
++
++  // Bit-packed single-INT32 key path: enabled when the pack plan covers all group keys, none
++  // have nulls at runtime, and neither the label-encode nor nested-key paths are active.
++  // Use the plan-time pack plan if available; otherwise build one from actual column data
++  // (handles the common case where group key stats are unavailable after joins/merges).
++  bool const runtime_pack_candidate =
++    !has_collect_set && !keys_already_radix && !any_nested_key && !group_idx.empty() &&
++    std::none_of(group_idx.begin(), group_idx.end(), [&](int i) {
++      return input_table.column(i).has_nulls();
++    });
++
++  std::optional<group_key_pack_plan> runtime_pack_plan;
++  if (runtime_pack_candidate && !key_pack_plan.has_value()) {
++    runtime_pack_plan = try_runtime_pack_plan(input_table, group_idx, stream, mr);
++  }
++  auto const* effective_pack_plan =
++    key_pack_plan.has_value()      ? &key_pack_plan.value()
++    : runtime_pack_plan.has_value() ? &runtime_pack_plan.value()
++                                    : nullptr;
++  bool const use_packed_keys = effective_pack_plan != nullptr && runtime_pack_candidate;
++
++  std::unique_ptr<cudf::column> packed_key_col;
++  std::vector<cudf::data_type> original_key_types;
++  if (use_packed_keys) {
++    original_key_types.reserve(group_idx.size());
++    for (int i : group_idx) {
++      original_key_types.push_back(input_table.column(i).type());
++    }
++    packed_key_col = detail::pack_group_key_columns(
++      input_table, group_idx, *effective_pack_plan, stream, mr);
++    SIRIUS_LOG_DEBUG(
++      "local_grouped_agg: bit-packed {} group key column(s) into a single INT32 ({} bits, "
++      "rows={}, plan={})",
++      group_idx.size(),
++      effective_pack_plan->total_bits,
++      input_table.num_rows(),
++      key_pack_plan.has_value() ? "plan-time" : "runtime");
++  }
++
+   std::vector<std::unique_ptr<cudf::column>> encoded_key_owners;
+   std::vector<cudf::column_view> group_cols;
+   group_cols.reserve(group_idx.size());
+   for (int idx : group_idx) {
+     if (use_label_keys) { break; }
++    if (use_packed_keys) { break; }
+     auto col = input_table.column(idx);
+     if (col.type().id() == cudf::type_id::STRING && col.size() > 0) {
+       cudf::strings_column_view scv(col);
+@@ -278,6 +415,7 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
+     }
+   }
+   if (use_label_keys) { group_cols.push_back(label_col->view()); }
++  if (use_packed_keys) { group_cols.push_back(packed_key_col->view()); }
+   cudf::groupby::groupby grpby_obj(cudf::table_view(group_cols), cudf::null_policy::INCLUDE);
+ 
+   // Make aggregation requests, group aggregations on the same column in the single request.
+@@ -355,6 +493,14 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
+     output_cols    = key_table->release();
+   }
+ 
++  // Unpack the single INT32 packed key back into the N original key columns.
++  // Runs at group cardinality (output of cuDF groupby), not input cardinality.
++  if (use_packed_keys) {
++    auto unpacked = detail::unpack_group_key_column(
++      output_cols[0]->view(), *effective_pack_plan, original_key_types, stream, mr);
++    output_cols = std::move(unpacked);
++  }
++
+   // Decode dictionary-encoded group key columns back to STRING
+   for (size_t i = 0; i < group_idx.size(); i++) {
+     if (output_cols[i]->type().id() == cudf::type_id::DICTIONARY32) {
+diff --git a/src/op/aggregate/pack_group_keys.cu b/src/op/aggregate/pack_group_keys.cu
+new file mode 100644
+index 00000000..d23ca7ce
+--- /dev/null
++++ b/src/op/aggregate/pack_group_keys.cu
+@@ -0,0 +1,213 @@
++/*
++ * Copyright 2026, Sirius Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#include "op/aggregate/pack_group_keys.hpp"
++
++#include <cudf/binaryop.hpp>
++#include <cudf/column/column.hpp>
++#include <cudf/column/column_factories.hpp>
++#include <cudf/column/column_view.hpp>
++#include <cudf/scalar/scalar.hpp>
++#include <cudf/types.hpp>
++#include <cudf/unary.hpp>
++#include <cudf/utilities/error.hpp>
++
++#include <rmm/cuda_stream_view.hpp>
++#include <rmm/device_uvector.hpp>
++#include <rmm/resource_ref.hpp>
++
++#include <algorithm>
++#include <stdexcept>
++
++namespace sirius::op::detail {
++
++namespace {
++
++struct pack_col_desc {
++  uint8_t const* data;  // offset-adjusted base pointer: element i lives at data + i*width
++  int32_t width;        // bytes per element: 1, 2, 4, or 8
++  bool is_signed;       // true for INT8/INT16/INT32/INT64
++  int64_t min_val;      // subtracted from every value before packing
++  int32_t shift;        // left-shift applied after subtraction
++};
++
++__global__ void pack_keys_kernel(pack_col_desc const* __restrict__ cols,
++                                 int ncols,
++                                 int32_t* __restrict__ out,
++                                 cudf::size_type n)
++{
++  auto idx          = static_cast<cudf::size_type>(blockIdx.x) * blockDim.x + threadIdx.x;
++  auto const stride = static_cast<cudf::size_type>(gridDim.x) * blockDim.x;
++  for (; idx < n; idx += stride) {
++    int32_t packed = 0;
++    for (int cc = 0; cc < ncols; ++cc) {
++      pack_col_desc const& d = cols[cc];
++      auto const* base       = d.data + static_cast<ptrdiff_t>(idx) * d.width;
++      int64_t val;
++      if (d.is_signed) {
++        switch (d.width) {
++          case 1: val = static_cast<int64_t>(*reinterpret_cast<int8_t const*>(base)); break;
++          case 2: val = static_cast<int64_t>(*reinterpret_cast<int16_t const*>(base)); break;
++          case 4: val = static_cast<int64_t>(*reinterpret_cast<int32_t const*>(base)); break;
++          default: val = *reinterpret_cast<int64_t const*>(base); break;
++        }
++      } else {
++        switch (d.width) {
++          case 1: val = static_cast<int64_t>(*reinterpret_cast<uint8_t const*>(base)); break;
++          case 2: val = static_cast<int64_t>(*reinterpret_cast<uint16_t const*>(base)); break;
++          case 4: val = static_cast<int64_t>(*reinterpret_cast<uint32_t const*>(base)); break;
++          default:
++            val = static_cast<int64_t>(*reinterpret_cast<uint64_t const*>(base));
++            break;
++        }
++      }
++      packed |= static_cast<int32_t>((val - d.min_val) << d.shift);
++    }
++    out[idx] = packed;
++  }
++}
++
++static dim3 grid_for(cudf::size_type n)
++{
++  constexpr int block_size    = 256;
++  int num_blocks_per_sm       = 0;
++  cudaOccupancyMaxActiveBlocksPerMultiprocessor(
++    &num_blocks_per_sm, pack_keys_kernel, block_size, 0);
++  int device_id = 0;
++  cudaGetDevice(&device_id);
++  int sm_count = 0;
++  cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id);
++  auto const resident_blocks = static_cast<cudf::size_type>(num_blocks_per_sm * sm_count);
++  auto const needed_blocks   = (n + block_size - 1) / block_size;
++  return {static_cast<unsigned>(std::min(needed_blocks, resident_blocks))};
++}
++
++}  // namespace
++
++std::unique_ptr<cudf::column> pack_group_key_columns(cudf::table_view const& input,
++                                                     std::vector<int> const& group_idx,
++                                                     group_key_pack_plan const& plan,
++                                                     rmm::cuda_stream_view stream,
++                                                     rmm::device_async_resource_ref mr)
++{
++  CUDF_EXPECTS(!group_idx.empty(), "pack_group_key_columns: group_idx must not be empty");
++  CUDF_EXPECTS(group_idx.size() == plan.cols.size(),
++               "pack_group_key_columns: group_idx and plan.cols size mismatch");
++
++  auto const n = input.num_rows();
++  auto out_col = cudf::make_fixed_width_column(
++    cudf::data_type{cudf::type_id::INT32}, n, cudf::mask_state::UNALLOCATED, stream, mr);
++
++  if (n == 0) { return out_col; }
++
++  auto const ncols = static_cast<int>(group_idx.size());
++  std::vector<pack_col_desc> h_descs(ncols);
++  for (int i = 0; i < ncols; ++i) {
++    auto const col   = input.column(group_idx[i]);
++    auto const& meta = plan.cols[static_cast<size_t>(i)];
++    auto const tid   = col.type().id();
++    int width;
++    bool is_signed;
++    switch (tid) {
++      case cudf::type_id::INT8: width = 1; is_signed = true; break;
++      case cudf::type_id::INT16: width = 2; is_signed = true; break;
++      case cudf::type_id::INT32: width = 4; is_signed = true; break;
++      case cudf::type_id::INT64: width = 8; is_signed = true; break;
++      case cudf::type_id::UINT8: width = 1; is_signed = false; break;
++      case cudf::type_id::UINT16: width = 2; is_signed = false; break;
++      case cudf::type_id::UINT32: width = 4; is_signed = false; break;
++      case cudf::type_id::UINT64: width = 8; is_signed = false; break;
++      default: throw std::runtime_error("pack_group_key_columns: unsupported column type");
++    }
++    h_descs[i].data      = col.head<uint8_t>() + static_cast<ptrdiff_t>(col.offset()) * width;
++    h_descs[i].width     = width;
++    h_descs[i].is_signed = is_signed;
++    h_descs[i].min_val   = meta.min_val;
++    h_descs[i].shift     = meta.shift;
++  }
++
++  rmm::device_uvector<pack_col_desc> d_descs(static_cast<size_t>(ncols), stream, mr);
++  cudaMemcpyAsync(d_descs.data(),
++                  h_descs.data(),
++                  static_cast<size_t>(ncols) * sizeof(pack_col_desc),
++                  cudaMemcpyHostToDevice,
++                  stream.value());
++
++  constexpr int block_size = 256;
++  pack_keys_kernel<<<grid_for(n), block_size, 0, stream.value()>>>(
++    d_descs.data(), ncols, out_col->mutable_view().data<int32_t>(), n);
++
++  return out_col;
++}
++
++std::vector<std::unique_ptr<cudf::column>> unpack_group_key_column(
++  cudf::column_view const& packed,
++  group_key_pack_plan const& plan,
++  std::vector<cudf::data_type> const& original_types,
++  rmm::cuda_stream_view stream,
++  rmm::device_async_resource_ref mr)
++{
++  CUDF_EXPECTS(plan.cols.size() == original_types.size(),
++               "unpack_group_key_column: plan and original_types size mismatch");
++
++  std::vector<std::unique_ptr<cudf::column>> result;
++  result.reserve(plan.cols.size());
++
++  for (size_t i = 0; i < plan.cols.size(); ++i) {
++    auto const& meta = plan.cols[i];
++    int32_t const mask =
++      (meta.bits >= 32) ? ~int32_t{0} : ((int32_t{1} << meta.bits) - int32_t{1});
++
++    // 1. Logical right-shift to position this column's bits at bit 0
++    cudf::numeric_scalar<int32_t> shift_scalar{meta.shift};
++    auto shifted = cudf::binary_operation(packed,
++                                          shift_scalar,
++                                          cudf::binary_operator::SHIFT_RIGHT_UNSIGNED,
++                                          cudf::data_type{cudf::type_id::INT32},
++                                          stream,
++                                          mr);
++
++    // 2. Mask to the allocated bits
++    cudf::numeric_scalar<int32_t> mask_scalar{mask};
++    auto masked = cudf::binary_operation(shifted->view(),
++                                         mask_scalar,
++                                         cudf::binary_operator::BITWISE_AND,
++                                         cudf::data_type{cudf::type_id::INT32},
++                                         stream,
++                                         mr);
++
++    // 3. Upcast to INT64, add min_val, then cast to the original type
++    auto as_int64 =
++      cudf::cast(masked->view(), cudf::data_type{cudf::type_id::INT64}, stream, mr);
++
++    if (meta.min_val != 0) {
++      cudf::numeric_scalar<int64_t> min_scalar{meta.min_val};
++      auto with_min = cudf::binary_operation(as_int64->view(),
++                                              min_scalar,
++                                              cudf::binary_operator::ADD,
++                                              cudf::data_type{cudf::type_id::INT64},
++                                              stream,
++                                              mr);
++      result.push_back(cudf::cast(with_min->view(), original_types[i], stream, mr));
++    } else {
++      result.push_back(cudf::cast(as_int64->view(), original_types[i], stream, mr));
++    }
++  }
++
++  return result;
++}
++
++}  // namespace sirius::op::detail
+diff --git a/src/op/aggregate/pack_group_keys.hpp b/src/op/aggregate/pack_group_keys.hpp
+new file mode 100644
+index 00000000..d9cb7d8f
+--- /dev/null
++++ b/src/op/aggregate/pack_group_keys.hpp
+@@ -0,0 +1,74 @@
++/*
++ * Copyright 2026, Sirius Contributors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#pragma once
++
++#include "op/aggregate/aggregate_op_util.hpp"
++
++#include <cudf/column/column.hpp>
++#include <cudf/column/column_view.hpp>
++#include <cudf/table/table_view.hpp>
++#include <cudf/types.hpp>
++
++#include <rmm/cuda_stream_view.hpp>
++#include <rmm/resource_ref.hpp>
++
++#include <memory>
++#include <vector>
++
++namespace sirius::op::detail {
++
++/**
++ * @brief Pack N integer group-by key columns into a single non-nullable INT32 column.
++ *
++ * Each row of the output is: OR((col_i[row] - min_i) << shift_i) for each column i.
++ * The pack plan supplies min_i and shift_i for each column.
++ *
++ * @param input Full input table
++ * @param group_idx Column indices of the group keys within `input`
++ * @param plan Packing metadata (min_val, shift, bits per column)
++ * @param stream CUDA stream
++ * @param mr Device memory resource
++ * @return Single non-nullable INT32 column with one packed key per row
++ */
++[[nodiscard]] std::unique_ptr<cudf::column> pack_group_key_columns(
++  cudf::table_view const& input,
++  std::vector<int> const& group_idx,
++  group_key_pack_plan const& plan,
++  rmm::cuda_stream_view stream,
++  rmm::device_async_resource_ref mr);
++
++/**
++ * @brief Unpack a single INT32 packed key column back into N original key columns.
++ *
++ * Each unpacked column is recovered as: cast((packed >> shift_i) & mask_i + min_i, original_type).
++ * Runs at group cardinality (output of cuDF groupby), not input cardinality.
++ *
++ * @param packed Single INT32 column produced by cuDF groupby from pack_group_key_columns output
++ * @param plan Packing metadata matching the pack step
++ * @param original_types cuDF data types of the original key columns
++ * @param stream CUDA stream
++ * @param mr Device memory resource
++ * @return N columns in group_idx order with original types restored
++ */
++[[nodiscard]] std::vector<std::unique_ptr<cudf::column>> unpack_group_key_column(
++  cudf::column_view const& packed,
++  group_key_pack_plan const& plan,
++  std::vector<cudf::data_type> const& original_types,
++  rmm::cuda_stream_view stream,
++  rmm::device_async_resource_ref mr);
++
++}  // namespace sirius::op::detail
+diff --git a/src/op/sirius_physical_grouped_aggregate.cpp b/src/op/sirius_physical_grouped_aggregate.cpp
+index 4e5d5d25..d6c8444b 100644
+--- a/src/op/sirius_physical_grouped_aggregate.cpp
++++ b/src/op/sirius_physical_grouped_aggregate.cpp
+@@ -105,6 +105,7 @@ std::unique_ptr<operator_data> sirius_physical_grouped_aggregate::execute(
+                                                               cudf_aggregates,
+                                                               cudf_aggregate_idx,
+                                                               cudf_aggregate_struct_col_indices,
++                                                              key_pack_plan,
+                                                               stream,
+                                                               *space,
+                                                               batch_telemetry());
+diff --git a/src/planner/sirius_plan_aggregate.cpp b/src/planner/sirius_plan_aggregate.cpp
+index 575fe3cd..7da905a2 100644
+--- a/src/planner/sirius_plan_aggregate.cpp
++++ b/src/planner/sirius_plan_aggregate.cpp
+@@ -573,6 +573,118 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
+   return true;
+ }
+ 
++static std::optional<sirius::op::group_key_pack_plan> try_group_key_pack_plan(
++  duckdb::LogicalAggregate& op)
++{
++  if (op.groups.empty() || op.grouping_sets.size() > 1 || !op.grouping_functions.empty()) {
++    return std::nullopt;
++  }
++
++  sirius::op::group_key_pack_plan plan;
++  int32_t total_bits = 0;
++  plan.cols.reserve(op.groups.size());
++
++  for (size_t i = 0; i < op.groups.size(); ++i) {
++    auto& group      = op.groups[i];
++    auto& stats      = op.group_stats[i];
++    auto& group_type = group->return_type;
++
++    switch (group_type.InternalType()) {
++      case duckdb::PhysicalType::INT8:
++      case duckdb::PhysicalType::INT16:
++      case duckdb::PhysicalType::INT32:
++      case duckdb::PhysicalType::INT64:
++      case duckdb::PhysicalType::UINT8:
++      case duckdb::PhysicalType::UINT16:
++      case duckdb::PhysicalType::UINT32:
++      case duckdb::PhysicalType::UINT64: break;
++      default: return std::nullopt;
++    }
++
++    if (!stats) {
++      switch (group_type.InternalType()) {
++        case duckdb::PhysicalType::INT8:
++        case duckdb::PhysicalType::INT16:
++        case duckdb::PhysicalType::UINT8:
++        case duckdb::PhysicalType::UINT16:
++          stats = duckdb::NumericStats::CreateUnknown(group_type).ToUnique();
++          duckdb::NumericStats::SetMin(*stats, duckdb::Value::MinimumValue(group_type));
++          duckdb::NumericStats::SetMax(*stats, duckdb::Value::MaximumValue(group_type));
++          break;
++        default: return std::nullopt;
++      }
++    }
++
++    auto& nstats = *stats;
++    if (!duckdb::NumericStats::HasMinMax(nstats)) { return std::nullopt; }
++    if (duckdb::NumericStats::Max(*stats) < duckdb::NumericStats::Min(*stats)) {
++      return std::nullopt;
++    }
++
++    duckdb::hugeint_t range_h;
++    switch (group_type.InternalType()) {
++      case duckdb::PhysicalType::INT8: range_h = get_range_hugeint<int8_t>(nstats); break;
++      case duckdb::PhysicalType::INT16: range_h = get_range_hugeint<int16_t>(nstats); break;
++      case duckdb::PhysicalType::INT32: range_h = get_range_hugeint<int32_t>(nstats); break;
++      case duckdb::PhysicalType::INT64: range_h = get_range_hugeint<int64_t>(nstats); break;
++      case duckdb::PhysicalType::UINT8: range_h = get_range_hugeint<uint8_t>(nstats); break;
++      case duckdb::PhysicalType::UINT16: range_h = get_range_hugeint<uint16_t>(nstats); break;
++      case duckdb::PhysicalType::UINT32: range_h = get_range_hugeint<uint32_t>(nstats); break;
++      case duckdb::PhysicalType::UINT64: range_h = get_range_hugeint<uint64_t>(nstats); break;
++      default: return std::nullopt;
++    }
++
++    uint64_t range;
++    if (!duckdb::Hugeint::TryCast(range_h, range)) { return std::nullopt; }
++    if (range > static_cast<uint64_t>(duckdb::NumericLimits<uint32_t>::Maximum())) {
++      return std::nullopt;
++    }
++
++    int32_t const bits =
++      static_cast<int32_t>(required_bits_for_value(duckdb::UnsafeNumericCast<uint32_t>(range)));
++    total_bits += bits;
++    if (total_bits > 32) { return std::nullopt; }
++
++    int64_t min_val;
++    switch (group_type.InternalType()) {
++      case duckdb::PhysicalType::INT8:
++        min_val = static_cast<int64_t>(duckdb::NumericStats::GetMin<int8_t>(nstats));
++        break;
++      case duckdb::PhysicalType::INT16:
++        min_val = static_cast<int64_t>(duckdb::NumericStats::GetMin<int16_t>(nstats));
++        break;
++      case duckdb::PhysicalType::INT32:
++        min_val = static_cast<int64_t>(duckdb::NumericStats::GetMin<int32_t>(nstats));
++        break;
++      case duckdb::PhysicalType::INT64:
++        min_val = duckdb::NumericStats::GetMin<int64_t>(nstats);
++        break;
++      case duckdb::PhysicalType::UINT8:
++        min_val = static_cast<int64_t>(duckdb::NumericStats::GetMin<uint8_t>(nstats));
++        break;
++      case duckdb::PhysicalType::UINT16:
++        min_val = static_cast<int64_t>(duckdb::NumericStats::GetMin<uint16_t>(nstats));
++        break;
++      case duckdb::PhysicalType::UINT32:
++        min_val = static_cast<int64_t>(duckdb::NumericStats::GetMin<uint32_t>(nstats));
++        break;
++      case duckdb::PhysicalType::UINT64:
++        min_val = static_cast<int64_t>(duckdb::NumericStats::GetMin<uint64_t>(nstats));
++        break;
++      default: return std::nullopt;
++    }
++
++    sirius::op::group_key_col_meta meta;
++    meta.min_val = min_val;
++    meta.shift   = total_bits - bits;  // start-bit position for this column
++    meta.bits    = bits;
++    plan.cols.push_back(meta);
++  }
++
++  plan.total_bits = total_bits;
++  return plan;
++}
++
+ /// cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT
+ /// to avoid overflow. We downcast to BIGINT at the plan level so all downstream operators
+ /// (including the result collector) use the correct type.
+@@ -650,6 +762,10 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
+   // use a partitioned or perfect hash aggregate if possible
+   duckdb::vector<duckdb::column_t> partition_columns;
+   duckdb::vector<std::size_t> required_bits;
++
++  // Compute pack plan from stats before any std::move on op.groups / op.expressions
++  auto key_pack_plan = try_group_key_pack_plan(op);
++
+   if (can_use_simple_aggregation &&
+       can_use_partitioned_aggregate(context, op, *plan, partition_columns)) {
+     auto group_by = duckdb::make_uniq_base<sirius::op::sirius_physical_operator,
+@@ -662,6 +778,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
+       op.estimated_cardinality,
+       group_validity,
+       op.distinct_validity);
++    group_by->Cast<sirius::op::sirius_physical_grouped_aggregate>().key_pack_plan =
++      std::move(key_pack_plan);
+     group_by->children.push_back(std::move(plan));
+     return group_by;
+   }
+@@ -677,6 +795,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
+       op.estimated_cardinality,
+       group_validity,
+       op.distinct_validity);
++    group_by->Cast<sirius::op::sirius_physical_grouped_aggregate>().key_pack_plan =
++      std::move(key_pack_plan);
+     group_by->children.push_back(std::move(plan));
+     return group_by;
+   }
+@@ -691,6 +811,8 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
+     op.estimated_cardinality,
+     group_validity,
+     op.distinct_validity);
++  group_by->Cast<sirius::op::sirius_physical_grouped_aggregate>().key_pack_plan =
++    std::move(key_pack_plan);
+   group_by->children.push_back(std::move(plan));
+   return group_by;
+ }
+diff --git a/test/cpp/operator/aggregate/test_gpu_merge_impl.cpp b/test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
+index 2398c257..18f2bd59 100644
+--- a/test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
++++ b/test/cpp/operator/aggregate/test_gpu_merge_impl.cpp
+@@ -566,7 +566,7 @@ batches_with_handles create_batches_with_local_grouped_agg_result(
+   for (int i = 0; i < num_batches; ++i) {
+     auto ro_batch = base_input.batches[i]->to_read_only();
+     auto batch    = gpu_aggregate_impl::local_grouped_aggregate(
+-      ro_batch, group_idx, aggregates, aggregate_idx, {}, cudf::get_default_stream(), mem_space);
++      ro_batch, group_idx, aggregates, aggregate_idx, {}, std::nullopt, cudf::get_default_stream(), mem_space);
+     result.batches.push_back(std::move(batch));
+   }
+ 
