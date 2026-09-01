@@ -90,11 +90,12 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_ungrouped_aggre
             break;
           }
           case cudf::type_id::DECIMAL64:
-            if (input_col.type().id() == cudf::type_id::DECIMAL64) {
-              output_type = cudf::data_type(cudf::type_id::DECIMAL128, output_type.scale());
-            }
+            // SUM(DECIMAL64) stays DECIMAL64: native int64 accumulation, matching the plan-level
+            // 64-bit cap in downcast_wide_aggregate_types (sirius_plan_aggregate.cpp).
             break;
           case cudf::type_id::DECIMAL32:
+            // DECIMAL32 is lifted to DECIMAL64 for overflow headroom (the declared type is capped
+            // to DECIMAL(18) == DECIMAL64 as well), never to the slow DECIMAL128 path.
             if (input_col.type().id() == cudf::type_id::DECIMAL32) {
               output_type = cudf::data_type(cudf::type_id::DECIMAL64, output_type.scale());
             }
@@ -389,15 +390,12 @@ std::shared_ptr<cucascade::data_batch> gpu_aggregate_impl::local_grouped_aggrega
     const auto& output_idx = input_col_to_output_idx[aggregate_col_id];
     for (size_t j = 0; j < output_idx.size(); ++j) {
       auto result_view = aggregation_result.results[j]->view();
-      // Widen decimal result for SUM (expected by duckdb)
+      // SUM output width is capped at 64 bits to match the plan-level cap in
+      // downcast_wide_aggregate_types (sirius_plan_aggregate.cpp): SUM(DECIMAL64) stays DECIMAL64
+      // (native int64 atomicAdd, no widen to DECIMAL128), and DECIMAL32 is only lifted to DECIMAL64
+      // for overflow headroom -- which is also what the declared type was capped to.
       if (requests[i].aggregations[j]->kind == cudf::aggregation::Kind::SUM) {
-        if (requests[i].values.type().id() == cudf::type_id::DECIMAL64) {
-          aggregation_result.results[j] =
-            cudf::cast(result_view,
-                       cudf::data_type(cudf::type_id::DECIMAL128, result_view.type().scale()),
-                       stream,
-                       memory_space.get_default_allocator());
-        } else if (requests[i].values.type().id() == cudf::type_id::DECIMAL32) {
+        if (requests[i].values.type().id() == cudf::type_id::DECIMAL32) {
           aggregation_result.results[j] =
             cudf::cast(result_view,
                        cudf::data_type(cudf::type_id::DECIMAL64, result_view.type().scale()),

@@ -573,19 +573,58 @@ static bool can_use_perfect_hash_aggregate(duckdb::ClientContext& context,
   return true;
 }
 
-/// cuDF does not support HUGEINT (int128). DuckDB widens aggregates like sum(int32) to HUGEINT
-/// to avoid overflow. We downcast to BIGINT at the plan level so all downstream operators
-/// (including the result collector) use the correct type.
-static void downcast_hugeint_types(duckdb::vector<duckdb::LogicalType>& types,
-                                   duckdb::vector<duckdb::unique_ptr<duckdb::Expression>>& exprs)
+/// cuDF does not support HUGEINT (int128), and a 128-bit DECIMAL SUM accumulates through a slow
+/// software compare-and-swap loop (there is no native int128 atomicAdd, unlike int64/int32).
+/// DuckDB widens aggregates to avoid overflow -- sum(int32)->HUGEINT and
+/// sum(decimal(15,2))->decimal(38,2) -- which pushes every SUM onto the 128-bit path and, in a
+/// stacked aggregate, poisons the next group-by's input with a 128-bit accumulator too.
+///
+/// To keep aggregation on native 64-bit atomics -- matching the CPU reference engine, which
+/// accumulates fixed-point measures in 64 bits (fixed8) -- we cap the aggregate *output* types at
+/// the plan level. The change propagates so all downstream operators (including the result
+/// collector) use the capped type. Group keys are never touched: only the aggregate result
+/// columns, which live at types[groups.size() + i] (LogicalAggregate::ResolveTypes emits groups,
+/// then aggregates).
+///
+///  - HUGEINT -> BIGINT, unconditionally and across the whole schema (cuDF has no int128 at all).
+///  - SUM producing DECIMAL(width>18) -> DECIMAL(18, scale) (18 digits is the widest decimal DuckDB
+///    still lays out in INT64 == cuDF DECIMAL64). Applied unconditionally: the cap fires before
+///    create_plan recurses into child operators, so the child's output type has not yet been
+///    capped when this runs on the outer (stacked) aggregate -- an input-width guard would see the
+///    DuckDB-assigned DECIMAL(38) and incorrectly skip the cap. Both layers are safe to cap because
+///    the original parquet data uses DECIMAL(<=18) (verified by downcast_decimals.py), so no
+///    intermediate SUM can overflow 64 bits for realistic benchmark values.
+///    SUM is the only aggregate DuckDB widens past 18 digits, so MIN/MAX/COUNT are unaffected.
+///
+/// Trade-off: a running sum that genuinely exceeds the 64-bit range overflows silently, exactly as
+/// it does in the reference engine.
+static void downcast_wide_aggregate_types(duckdb::LogicalAggregate& op)
 {
-  for (auto& type : types) {
+  for (auto& type : op.types) {
     if (type == duckdb::LogicalType::HUGEINT) { type = duckdb::LogicalType::BIGINT; }
   }
-  for (auto& expr : exprs) {
-    if (expr->return_type == duckdb::LogicalType::HUGEINT) {
-      expr->return_type = duckdb::LogicalType::BIGINT;
+  for (size_t i = 0; i < op.expressions.size(); ++i) {
+    auto& agg = op.expressions[i]->Cast<duckdb::BoundAggregateExpression>();
+    auto& ret = op.expressions[i]->return_type;
+    if (ret == duckdb::LogicalType::HUGEINT) {
+      ret = duckdb::LogicalType::BIGINT;
+    } else if (agg.function.name == "sum" && ret.id() == duckdb::LogicalTypeId::DECIMAL &&
+               duckdb::DecimalType::GetWidth(ret) > 18) {
+      ret = duckdb::LogicalType::DECIMAL(18, duckdb::DecimalType::GetScale(ret));
+      // Cap input reference types too: extract_aggregate_expressions hoists these into a
+      // projection whose native type restore_native_columns uses when widening back from
+      // compressed narrow carriers. Without this, a DECIMAL(38) child type causes
+      // restore to widen decimal64 -> decimal128 before the stacked aggregate.
+      for (auto& child : agg.children) {
+        if (child->return_type.id() == duckdb::LogicalTypeId::DECIMAL &&
+            duckdb::DecimalType::GetWidth(child->return_type) > 18) {
+          child->return_type =
+            duckdb::LogicalType::DECIMAL(18, duckdb::DecimalType::GetScale(child->return_type));
+        }
+      }
     }
+    auto const type_idx = op.groups.size() + i;
+    if (type_idx < op.types.size()) { op.types[type_idx] = ret; }
   }
 }
 
@@ -596,8 +635,9 @@ sirius_physical_plan_generator::create_plan(duckdb::LogicalAggregate& op)
 {
   D_ASSERT(op.children.size() == 1);
 
-  // Downcast HUGEINT to BIGINT since cuDF does not support int128
-  downcast_hugeint_types(op.types, op.expressions);
+  // Cap aggregate outputs at native 64-bit atomic width: HUGEINT->BIGINT (cuDF has no int128) and
+  // wide DECIMAL->DECIMAL(18) (no native int128 atomicAdd). Keeps stacked SUMs off the slow path.
+  downcast_wide_aggregate_types(op);
 
   // Reject nested GROUP BY keys before extract_aggregate_expressions rewrites
   // groups into bare references (which lose the name needed for the error).
